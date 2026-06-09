@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.eggs/
+
+# 模型权重 / 大数据文件
+*.pt
+*.pth
+*.onnx
+*.weights
+*.engine
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# 临时文件
+*.log
+tmp/
+.DS_Store
+*~
