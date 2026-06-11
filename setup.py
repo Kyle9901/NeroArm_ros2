@@ -48,7 +48,7 @@ class CustomDevelop(setuptools.command.develop.develop):
 setup(
     name=package_name,
     version='0.0.1',
-    packages=[package_name],
+    packages=[package_name, 'mcp_server', 'mcp_server.tools'],
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
@@ -56,7 +56,7 @@ setup(
         (os.path.join('share', package_name, 'launch'),
             glob(os.path.join('launch', '*.launch.py'))),
     ],
-    install_requires=['setuptools'],
+    install_requires=['setuptools', 'opencv-python', 'numpy', 'requests'],
     zip_safe=False,
     maintainer='Alkaid',
     maintainer_email='alkaid@example.com',
@@ -68,6 +68,7 @@ setup(
             'vlm_picker = vision_grasp.vlm_picker_node:main',
             'grasp_executor = vision_grasp.grasp_executor:main',
             'test_move_to = vision_grasp.test_move_to:main',
+            'robot_arm_mcp = mcp_server.server:main',
         ],
     },
     cmdclass={
