@@ -44,6 +44,26 @@ from .vlm_client import VlmClient
 ARM_JOINT_NAMES = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"]
 GRIPPER_JOINT_NAMES = ["gripper_joint1", "gripper_joint2"]
 
+# MoveIt error codes → human-friendly hints
+_MOVEIT_ERROR_HINTS = {
+    0:     None,          # preempted — "motion was cancelled"
+    1:     None,          # SUCCESS
+    99999: None,          # FAILURE (generic)
+    -1:    "Planning failed. Try: (1) check if the target is reachable, (2) move closer to the target first, (3) call arm_go_home and retry",
+    -2:    "Planning timed out — MoveIt could not find a valid path. Try adjusting the target position (especially Z height) or call arm_go_home first",
+    -3:    "Planner returned an invalid trajectory. Try arm_go_home to reset the planner, or adjust the target pose",
+    -4:    "Motion was aborted during execution. The arm may be near an obstacle or joint limit — call arm_stop then arm_go_home",
+    -5:    "Robot is already at the target pose — no motion needed",
+}
+
+
+def _friendly_error(prefix: str, code: int) -> str:
+    """Convert a MoveIt error_code to a human-readable message with actionable hints."""
+    hint = _MOVEIT_ERROR_HINTS.get(code)
+    if hint:
+        return f"{prefix} (code={code}). Hint: {hint}"
+    return f"{prefix} (code={code}). Check MoveIt logs for details or try arm_go_home to reset"
+
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════
 class RobotBridgeNode(Node):
@@ -69,6 +89,10 @@ class RobotBridgeNode(Node):
 
         # --- motion ---
         self._joint_state: Optional[JointState] = None
+
+        # --- active goal handles (for cancellation) ---
+        self._active_goal_handles: list = []  # ClientGoalHandle
+        self._gh_lock = threading.Lock()
 
         # ── subscribers ──
         self.create_subscription(Image, "/camera/color/image_raw", self._color_cb, 10)
@@ -105,10 +129,12 @@ class RobotBridgeNode(Node):
         p("place_z", 0.20)
         p("gripper_open_width", 0.10)
         p("gripper_close_width", 0.02)
-        p("planning_time", 5.0)
-        p("num_planning_attempts", 20)
-        p("velocity_scaling", 0.05)
-        p("accel_scaling", 0.05)
+        p("planning_time", 3.0)
+        p("num_planning_attempts", 5)
+        p("velocity_scaling", 0.15)           # normal motion (approach / lift / home)
+        p("accel_scaling", 0.15)
+        p("descent_velocity_scaling", 0.05)  # slow, precise Cartesian descent
+        p("descent_accel_scaling", 0.05)
         p("cartesian_eef_step", 0.005)
         p("cartesian_min_fraction", 0.5)
         p("cartesian_jump_threshold", 2.0)
@@ -299,12 +325,19 @@ class RobotBridgeNode(Node):
             js = self._joint_state
         if js is None:
             return {"joints": {}, "gripper": {}}
-        return {
+        result = {
             "joints": {n: float(p) for n, p in zip(js.name, js.position)
                        if n in ARM_JOINT_NAMES},
             "gripper": {n: float(p) for n, p in zip(js.name, js.position)
                         if n in GRIPPER_JOINT_NAMES},
         }
+        # gripper opening width: gripper_joint1 = +width/2, gripper_joint2 = -width/2
+        g = result["gripper"]
+        if "gripper_joint1" in g and "gripper_joint2" in g:
+            result["gripper_width"] = abs(g["gripper_joint1"] - g["gripper_joint2"])
+        else:
+            result["gripper_width"] = None
+        return result
 
     def workspace_check(self, x, y) -> bool:
         return (self._workspace_x_min <= x <= self._workspace_x_max and
@@ -428,28 +461,41 @@ class RobotBridgeNode(Node):
         goal.planning_options.plan_only = False
 
         sf = self._move_group_ac.send_goal_async(goal)
+        self._track_goal(sf)
         if not self._spin_until(sf, timeout):
-            return False, "MoveGroup send timeout"
+            return False, ("MoveGroup action server did not respond in time. "
+                                "Check that MoveIt 2 (move_group) is running. "
+                                "Run: ros2 run moveit_ros_move_group move_group --ros-args --params-file <config>")
         gh = sf.result()
         if gh is None or not gh.accepted:
-            return False, "MoveGroup goal rejected"
+            return False, ("MoveGroup goal rejected — the planner refused the request. "
+                                "Possibly: (1) target is unreachable or in collision, "
+                                "(2) robot is already at the target, "
+                                "(3) start state is invalid. Try arm_go_home and retry")
         rf = gh.get_result_async()
         if not self._spin_until(rf, timeout + 5):
-            return False, "MoveGroup result timeout"
+            return False, ("MoveGroup result did not arrive in time "
+                                f"(timeout={timeout + max_plan:.0f}s). "
+                                "The motion may still be executing — check the robot's position. "
+                                "If the robot is moving, wait for it to stop then call arm_get_status")
         code = rf.result().result.error_code.val
         if code != MoveItErrorCodes.SUCCESS:
-            return False, f"MoveGroup error_code={code}"
+            return False, _friendly_error("MoveGroup planning failed", code)
         return True, "ok"
 
     def move_to_pose(self, x: float, y: float, z: float, quat: list[float] | None = None,
-                     timeout=20.0) -> tuple[bool, str]:
-        """Move to Cartesian pose via MoveGroup.  quat defaults to grasp_quat."""
+                     timeout=60.0) -> tuple[bool, str]:
+        """Move to Cartesian pose via MoveGroup.  quat defaults to grasp_quat.
+        timeout covers the full planning + execution cycle."""
         if quat is None:
             quat = list(self._get_param("grasp_quat"))
         quat = self._normalize_quat(quat)
 
         if not self.workspace_check(x, y):
-            return False, f"pose ({x:.3f},{y:.3f}) outside workspace"
+            return False, (f"pose ({x:.3f},{y:.3f}) outside workspace "
+                           f"[x: {self._workspace_x_min:.2f} to {self._workspace_x_max:.2f}, "
+                           f"y: {self._workspace_y_min:.2f} to {self._workspace_y_max:.2f}]. "
+                           f"Use arm_get_status to see workspace bounds, then pick a target inside them")
 
         goal = _ma.MoveGroup.Goal()
         req = goal.request
@@ -463,22 +509,36 @@ class RobotBridgeNode(Node):
         goal.planning_options.plan_only = False
 
         sf = self._move_group_ac.send_goal_async(goal)
-        if not self._spin_until(sf, timeout):
-            return False, "MoveGroup send timeout"
+        self._track_goal(sf)
+        if not self._spin_until(sf, 5.0):
+            return False, ("MoveGroup action server did not respond in time. "
+                                "Check that MoveIt 2 (move_group) is running. "
+                                "Run: ros2 run moveit_ros_move_group move_group --ros-args --params-file <config>")
         gh = sf.result()
         if gh is None or not gh.accepted:
-            return False, "MoveGroup goal rejected"
+            return False, ("MoveGroup goal rejected — the planner refused the request. "
+                                "Possibly: (1) target is unreachable or in collision, "
+                                "(2) robot is already at the target, "
+                                "(3) start state is invalid. Try arm_go_home and retry")
         rf = gh.get_result_async()
-        if not self._spin_until(rf, timeout + self._get_param("planning_time")):
-            return False, "MoveGroup result timeout"
+        # result timeout: planning (attempts * planning_time) + execution + buffer
+        max_plan = self._get_param("num_planning_attempts") * self._get_param("planning_time")
+        if not self._spin_until(rf, timeout + max_plan):
+            return False, ("MoveGroup result did not arrive in time "
+                                f"(timeout={timeout + max_plan:.0f}s). "
+                                "The motion may still be executing — check the robot's position. "
+                                "If the robot is moving, wait for it to stop then call arm_get_status")
         code = rf.result().result.error_code.val
         if code != MoveItErrorCodes.SUCCESS:
-            return False, f"MoveGroup error_code={code}"
+            return False, _friendly_error("MoveGroup planning failed", code)
         return True, "ok"
 
     def move_cartesian(self, x: float, y: float, z: float, quat: list[float] | None = None,
-                       timeout=20.0) -> tuple[bool, str]:
-        """Straight-line Cartesian motion."""
+                       timeout=30.0, velocity_override: float | None = None,
+                       accel_override: float | None = None) -> tuple[bool, str]:
+        """Straight-line Cartesian motion. timeout covers planning + execution.
+        velocity_override / accel_override: if set, use these instead of the
+        default velocity_scaling / accel_scaling params (e.g. for slow descent)."""
         if quat is None:
             quat = list(self._get_param("grasp_quat"))
         quat = self._normalize_quat(quat)
@@ -501,19 +561,24 @@ class RobotBridgeNode(Node):
         req.max_step = self._get_param("cartesian_eef_step")
         req.jump_threshold = self._get_param("cartesian_jump_threshold")
         req.avoid_collisions = True
-        req.max_velocity_scaling_factor = self._get_param("velocity_scaling")
-        req.max_acceleration_scaling_factor = self._get_param("accel_scaling")
+        req.max_velocity_scaling_factor = velocity_override if velocity_override is not None else self._get_param("velocity_scaling")
+        req.max_acceleration_scaling_factor = accel_override if accel_override is not None else self._get_param("accel_scaling")
 
         sf = self._cartesian_cli.call_async(req)
         if not self._spin_until(sf, timeout):
-            return False, "cartesian_path call timeout"
+            return False, ("cartesian_path service did not respond. "
+                           "Check that /compute_cartesian_path is available in MoveIt")
         resp = sf.result()
         if resp is None:
-            return False, "cartesian_path no response"
+            return False, ("cartesian_path service returned no result. "
+                           "This is a MoveIt internal error — try arm_go_home to reset")
         if resp.error_code.val != MoveItErrorCodes.SUCCESS:
-            return False, f"cartesian_path error_code={resp.error_code.val}"
+            return False, _friendly_error("cartesian_path planning failed", resp.error_code.val)
         if resp.fraction < self._get_param("cartesian_min_fraction"):
-            return False, f"cartesian coverage {resp.fraction:.1%} too low"
+            return False, (f"cartesian path only {resp.fraction:.0%} reachable "
+                           f"(needs {self._get_param('cartesian_min_fraction'):.0%}). "
+                           f"The target is too far or blocked by an obstacle. "
+                           f"Try arm_go_home first or move to a closer waypoint")
 
         return self._execute_trajectory(resp.solution, timeout)
 
@@ -521,17 +586,23 @@ class RobotBridgeNode(Node):
         goal = _ma.ExecuteTrajectory.Goal()
         goal.trajectory = robot_traj
         sf = self._execute_ac.send_goal_async(goal)
+        self._track_goal(sf)
         if not self._spin_until(sf, timeout):
-            return False, "execute_trajectory send timeout"
+            return False, ("execute_trajectory action server did not respond. "
+                                "Check that /execute_trajectory is available in MoveIt")
         gh = sf.result()
         if gh is None or not gh.accepted:
-            return False, "execute_trajectory rejected"
+            return False, ("execute_trajectory goal rejected — "
+                                "the executor refused the trajectory. "
+                                "The trajectory may be invalid or the controller is busy")
         rf = gh.get_result_async()
         if not self._spin_until(rf, timeout):
-            return False, "execute_trajectory result timeout"
+            return False, ("execute_trajectory result did not arrive in time. "
+                                "The arm may still be moving — check the robot. "
+                                "If it's moving, call arm_stop then arm_go_home")
         code = rf.result().result.error_code.val
         if code != MoveItErrorCodes.SUCCESS:
-            return False, f"execute_trajectory error_code={code}"
+            return False, _friendly_error("execute_trajectory failed", code)
         return True, "ok"
 
     def control_gripper(self, width: float, duration=1.5, timeout=5.0) -> tuple[bool, str]:
@@ -550,23 +621,56 @@ class RobotBridgeNode(Node):
         goal.trajectory.points.append(pt)
 
         sf = self._gripper_ac.send_goal_async(goal)
+        self._track_goal(sf)
         if not self._spin_until(sf, timeout):
-            return False, "gripper send timeout"
+            return False, ("gripper action server did not respond. "
+                                "Check that gripper_controller is running")
         gh = sf.result()
         if gh is None or not gh.accepted:
-            return False, "gripper rejected"
+            return False, ("gripper goal rejected. "
+                           "The gripper controller may be busy or in an error state")
         rf = gh.get_result_async()
         if not self._spin_until(rf, timeout + duration):
-            return False, "gripper result timeout"
+            return False, ("gripper result did not arrive in time. "
+                           "The gripper may still be moving — check gripper_joint1/2 position")
         code = rf.result().result.error_code
         if code != 0:
-            return False, f"gripper error_code={code}"
+            return False, (f"gripper failed with error_code={code}. "
+                           "Check gripper controller status and mechanical limits")
         return True, "ok"
 
     def go_home(self, timeout=20.0) -> tuple[bool, str]:
         """Move to home joint configuration."""
         home_deg = list(self._get_param("home_joints_deg"))
         return self.move_joints(home_deg, timeout)
+
+    # ── goal tracking for emergency stop ──
+    def _track_goal(self, send_future):
+        """Track a send_goal_async future so emergency_stop can cancel it."""
+        if hasattr(send_future, 'add_done_callback'):
+            def _on_done(f):
+                gh = f.result()
+                if gh is not None:
+                    with self._gh_lock:
+                        self._active_goal_handles.append(gh)
+            send_future.add_done_callback(_on_done)
+
+    def emergency_stop(self) -> tuple[bool, str]:
+        """Cancel all active MoveIt / gripper / execute goals immediately."""
+        cancelled = 0
+        with self._gh_lock:
+            for gh in self._active_goal_handles:
+                try:
+                    gh.cancel_goal_async()
+                    cancelled += 1
+                except Exception:
+                    pass
+            self._active_goal_handles.clear()
+
+        if cancelled > 0:
+            self.get_logger().warn(f"EMERGENCY STOP: cancelled {cancelled} active goal(s)")
+            return True, f"cancelled {cancelled} active goal(s)"
+        return True, "no active goals to cancel"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════
@@ -582,6 +686,8 @@ class RobotBridge:
         self._spin_thread: threading.Thread | None = None
         self._ready = threading.Event()
         self._shutdown_flag = False
+        self._holding = False    # whether gripper is currently holding an object
+        self._holding_lock = threading.Lock()
 
     # ── lifecycle ──
     def start(self, wait_servers: bool = False) -> None:
@@ -646,6 +752,24 @@ class RobotBridge:
 
     def get_velocity_scaling(self) -> float:
         return self.node._get_param("velocity_scaling")
+
+    def get_descent_velocity_scaling(self) -> float:
+        return self.node._get_param("descent_velocity_scaling")
+
+    def get_descent_accel_scaling(self) -> float:
+        return self.node._get_param("descent_accel_scaling")
+
+    def emergency_stop(self) -> tuple[bool, str]:
+        return self.node.emergency_stop()
+
+    # ── holding state ──
+    def get_holding(self) -> bool:
+        with self._holding_lock:
+            return self._holding
+
+    def set_holding(self, value: bool) -> None:
+        with self._holding_lock:
+            self._holding = value
 
     def get_base_frame(self) -> str:
         return self.node._get_param("base_frame")

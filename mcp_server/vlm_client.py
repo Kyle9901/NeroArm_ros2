@@ -68,8 +68,8 @@ def _filter_by_location(candidates, hint, img_w, img_h):
     return result
 
 
-def detect_by_color(color_img: np.ndarray, color_name: str, location_hint: str = ""):
-    """OpenCV HSV colour detection → bbox (xmin,ymin,xmax,ymax) or None."""
+def _color_candidates(color_img: np.ndarray, color_name: str, include_alternatives: bool = False) -> list[dict]:
+    """OpenCV HSV colour detection → list of candidate dicts."""
     hsv = cv2.cvtColor(color_img, cv2.COLOR_BGR2HSV)
     h, w = color_img.shape[:2]
     img_area = h * w
@@ -78,11 +78,12 @@ def detect_by_color(color_img: np.ndarray, color_name: str, location_hint: str =
     color_lower = color_name.lower()
     if color_lower in _COLOR_HSV_RANGES:
         ranges.extend(_COLOR_HSV_RANGES[color_lower])
-    for alt in (["purple", "cyan"] if color_lower == "blue" else []):
-        if alt in _COLOR_HSV_RANGES:
-            ranges.extend(_COLOR_HSV_RANGES[alt])
+    if include_alternatives:
+        for alt in (["purple", "cyan"] if color_lower == "blue" else []):
+            if alt in _COLOR_HSV_RANGES:
+                ranges.extend(_COLOR_HSV_RANGES[alt])
     if not ranges:
-        return None
+        return []
 
     combined_mask = None
     for (lower, upper) in ranges:
@@ -106,14 +107,50 @@ def detect_by_color(color_img: np.ndarray, color_name: str, location_hint: str =
         aspect = bw / max(bh, 1)
         if aspect < 0.2 or aspect > 5.0:
             continue
-        candidates.append({"area": area, "x": x, "y": y, "xmax": x + bw, "ymax": y + bh, "cx": cx, "cy": cy})
+        candidates.append({
+            "color": color_lower,
+            "area": area,
+            "x": x,
+            "y": y,
+            "xmax": x + bw,
+            "ymax": y + bh,
+            "cx": cx,
+            "cy": cy,
+        })
+    return candidates
 
+
+def detect_by_color(color_img: np.ndarray, color_name: str, location_hint: str = ""):
+    """OpenCV HSV colour detection → bbox (xmin,ymin,xmax,ymax) or None."""
+    h, w = color_img.shape[:2]
+    candidates = _color_candidates(color_img, color_name, include_alternatives=True)
     if not candidates:
         return None
 
     filtered = _filter_by_location(candidates, location_hint, w, h) or candidates
     best = max(filtered, key=lambda c: c["area"])
     return (best["x"], best["y"], best["xmax"], best["ymax"])
+
+
+def detect_all_color_blocks(color_img: np.ndarray, location_hint: str = "") -> list[dict]:
+    """Detect all visible solid-colour blocks with OpenCV HSV detection."""
+    h, w = color_img.shape[:2]
+    blocks = []
+    for color_name in _COLOR_HSV_RANGES:
+        candidates = _color_candidates(color_img, color_name)
+        candidates = _filter_by_location(candidates, location_hint, w, h) or candidates
+        for c in candidates:
+            xmin, ymin, xmax, ymax = int(c["x"]), int(c["y"]), int(c["xmax"]), int(c["ymax"])
+            blocks.append({
+                "color": color_name,
+                "bbox": [xmin, ymin, xmax, ymax],
+                "center_2d": [int((xmin + xmax) / 2), int((ymin + ymax) / 2)],
+                "area_px": float(c["area"]),
+                "source": "CV",
+            })
+
+    blocks.sort(key=lambda b: b["area_px"], reverse=True)
+    return blocks
 
 
 # ─────────────────────────── Prompt template (from vlm_picker_node) ─────────────────────────
@@ -198,7 +235,10 @@ class VlmClient:
 
         resp = requests.post(self.api_url, headers=headers, json=payload, timeout=timeout)
         if resp.status_code != 200:
-            raise RuntimeError(f"VLM API status={resp.status_code}: {resp.text[:300]}")
+            raise RuntimeError(
+                f"VLM API returned HTTP {resp.status_code}. "
+                f"Check VLM_API_KEY is valid and VLM_MODEL is correct. "
+                f"Detail: {resp.text[:200]}")
         body = resp.json()
         text = body["choices"][0]["message"]["content"].strip()
         if text.startswith("```"):
@@ -251,7 +291,10 @@ class VlmClient:
         if xmin is None:
             b = raw.get("bbox", {})
             if not all(k in b for k in ("xmin", "ymin", "xmax", "ymax")):
-                raise RuntimeError(f"VLM bbox incomplete: {b}")
+                raise RuntimeError(
+                    f"VLM returned incomplete bbox: {b}. "
+                    "The model did not follow the JSON output format. "
+                    "Try simplifying the target description or retry")
             xmin = int(b["xmin"])
             ymin = int(b["ymin"])
             xmax = int(b["xmax"])

@@ -49,7 +49,10 @@ TOOL_DEFINITIONS = [
     {
         "name": "arm_capture_image",
         "description": "Capture the latest colour image from the robot's eye-in-hand camera. "
-                       "Returns a base64-encoded JPEG and depth statistics.",
+                       "Returns a base64-encoded JPEG and depth statistics. "
+                       "⚠️ Do NOT use this to verify whether the gripper is holding an object — "
+                       "the camera cannot reliably see the gripper at safe height. "
+                       "Use arm_get_status.holding instead.",
         "inputSchema": {
             "type": "object",
             "properties": {},
@@ -58,17 +61,21 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "arm_detect_vlm",
-        "description": "Detect an object in the current camera frame using the VLM (Vision Language Model). "
-                       "Describe the target in natural language, e.g. 'blue block' or 'red cube'. "
-                       "The VLM will classify the object and return a bounding box. "
+        "description": "Detect ONE specified object in the current camera frame using the VLM. "
+                       "Internally captures the current camera frame — do NOT call arm_capture_image before this. "
+                       "⚠️ Do NOT use this to verify whether the gripper is holding an object after grasp — "
+                       "the gripper is at safe height and the camera cannot reliably see it. "
+                       "Use arm_get_status.holding instead. "
+                       "Use when the user specifies a target, e.g. 'blue block', 'red cube', 'metal bottle'. "
+                       "For generic requests like '识别桌面上的物块' / 'detect blocks on the table', use arm_detect_blocks instead. "
                        "For colour blocks, OpenCV HSV detection is used as a fallback for higher precision. "
-                       "For best results, call arm_go_home before this tool to give the camera an unobstructed view.",
+                       "Typical workflow: arm_go_home → arm_detect_vlm(target) → arm_get_3d_position(center_2d) → arm_execute_grasp.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "target": {
                     "type": "string",
-                    "description": "Natural language description of the object to detect, e.g. 'blue block', 'red cube', 'metal bottle'.",
+                    "description": "Natural language description of ONE object to detect, e.g. 'blue block', 'red cube', 'metal bottle'.",
                 },
             },
             "required": ["target"],
@@ -76,15 +83,18 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "arm_detect_color",
-        "description": "Detect a colour block using OpenCV HSV colour detection (no VLM call). "
-                       "Faster than arm_detect_vlm but only works for solid-colour blocks. "
+        "description": "Detect ONE specified colour block using OpenCV HSV colour detection (no VLM call). "
+                       "Use this ONLY when the user explicitly specifies a colour, e.g. 'blue block'. "
+                       "Do NOT use this tool to search for all blocks or enumerate colours. "
+                       "For generic requests like '识别桌面上的物块', use arm_detect_blocks. "
+                       "Not-found is returned as success=true, found=false (not a tool error). "
                        "Supported colours: blue, red, green, yellow, purple, orange, cyan.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "color_name": {
                     "type": "string",
-                    "description": "Colour name: blue, red, green, yellow, purple, orange, cyan.",
+                    "description": "Explicit colour name: blue, red, green, yellow, purple, orange, cyan.",
                 },
                 "location_hint": {
                     "type": "string",
@@ -92,6 +102,25 @@ TOOL_DEFINITIONS = [
                 },
             },
             "required": ["color_name"],
+        },
+    },
+    {
+        "name": "arm_detect_blocks",
+        "description": "Detect ALL visible solid-colour blocks on the table in ONE tool call using OpenCV HSV detection. "
+                       "Use this for generic requests like '识别桌面上的物块', 'detect blocks on the table', or 'what blocks are visible'. "
+                       "Do NOT call arm_detect_color repeatedly to enumerate colours. "
+                       "Returns count and a blocks list with color, bbox, center_2d, area_px. "
+                       "Internally captures the camera frame — do NOT call arm_capture_image before this. "
+                       "Typical workflow: arm_go_home → arm_detect_blocks → choose a block → arm_get_3d_position(center_2d).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "location_hint": {
+                    "type": "string",
+                    "description": "Optional location hint: left, right, top, bottom, center. Defaults to empty (full image).",
+                },
+            },
+            "required": [],
         },
     },
     {
@@ -109,7 +138,10 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "arm_get_status",
-        "description": "Get the current state of the robot arm: joint angles (degrees) and gripper position.",
+        "description": "Get the current state of the robot arm: joint angles (degrees), gripper position, "
+                       "holding state (whether gripper is currently holding an object), "
+                       "workspace bounds (x/y min/max), safe height, and desk surface Z. "
+                       "Call this before any motion sequence to check the arm's current condition.",
         "inputSchema": {
             "type": "object",
             "properties": {},
@@ -141,7 +173,8 @@ TOOL_DEFINITIONS = [
     {
         "name": "arm_move_to_pose",
         "description": "Move the robot TCP to a Cartesian pose (x, y, z in metres) via MoveGroup motion planning. "
-                       "The orientation defaults to the pre-configured grasp quaternion.",
+                       "The orientation defaults to the pre-configured grasp quaternion. "
+                       "Timeout covers planning (5 attempts × 3s) + execution.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -155,7 +188,7 @@ TOOL_DEFINITIONS = [
                     "maxItems": 4,
                     "description": "Optional quaternion [x, y, z, w]. Defaults to grasp quat.",
                 },
-                "timeout": {"type": "number", "description": "Timeout in seconds. Default: 20."},
+                "timeout": {"type": "number", "description": "Timeout in seconds. Default: 60."},
             },
             "required": ["x", "y", "z"],
         },
@@ -163,7 +196,8 @@ TOOL_DEFINITIONS = [
     {
         "name": "arm_move_cartesian",
         "description": "Move the robot TCP along a straight line in Cartesian space. "
-                       "Use this for precise vertical descent / ascent.",
+                       "Use this for precise vertical descent / ascent. "
+                       "Default timeout: 30s.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -177,7 +211,7 @@ TOOL_DEFINITIONS = [
                     "maxItems": 4,
                     "description": "Optional quaternion [x, y, z, w]. Defaults to grasp quat.",
                 },
-                "timeout": {"type": "number", "description": "Timeout in seconds. Default: 20."},
+                "timeout": {"type": "number", "description": "Timeout in seconds. Default: 30."},
             },
             "required": ["x", "y", "z"],
         },
@@ -220,11 +254,17 @@ TOOL_DEFINITIONS = [
         "name": "arm_execute_grasp",
         "description": "Pick up an object at (x, y, z) in base_link frame. "
                        "Steps: 1) open gripper + move to approach pose, "
-                       "2) Cartesian descent to grasp, "
-                       "3) close gripper, "
+                       "2) SLOW Cartesian descent to grasp, "
+                       "3) close gripper + MEASURE actual gripper width, "
                        "4) lift to safe height. "
-                       "After this call, the object is held at safe height. "
-                       "Use arm_execute_place() to put it down, or call arm_execute_swap() to swap two objects. "
+                       "RETURNS: 'holding' field (bool) — TRUE if the gripper stayed open after closing "
+                       "(object physically blocked it), FALSE if the gripper fully closed (nothing inside). "
+                       "TRUST this field — it is measured from the actual gripper hardware, not estimated. "
+                       "Do NOT call arm_capture_image or arm_detect_vlm to verify — the camera cannot "
+                       "reliably see the gripper after lift. "
+                       "If holding=false, the object was MISSED; either retry the grasp or report to the user. "
+                       "If holding=true, the object is held at safe height; use arm_execute_place() to put it down. "
+                       "On failure, automatically attempts recovery to safe height. "
                        "⚠️ This will physically move the robot — ensure the workspace is clear!",
         "inputSchema": {
             "type": "object",
@@ -244,11 +284,15 @@ TOOL_DEFINITIONS = [
     {
         "name": "arm_execute_place",
         "description": "Place the currently held object at (x, y, z) in base_link frame. "
+                       "z is the SURFACE height (e.g. desk top z=0.0) — the arm internally adds "
+                       "the same flange offset (0.155m) used during grasping, so the gripper tip "
+                       "stays safely above the surface. Use the same z from arm_get_3d_position. "
                        "Steps: 1) move to above place pose, "
                        "2) Cartesian descent to place Z, "
                        "3) open gripper. "
-                       "After this call, the hand is empty. "
-                       "Does NOT go home — caller can chain another grasp or call arm_go_home().",
+                       "After this call, the hand is empty (arm_get_status will show holding=false). "
+                       "Does NOT go home — caller can chain another grasp or call arm_go_home(). "
+                       "On failure, automatically attempts recovery to safe height.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -281,11 +325,12 @@ def _call_tool(name: str, args: dict, bridge: RobotBridge, vlm: VlmClient) -> di
         "arm_capture_image":   lambda: _tools.arm_capture_image(bridge),
         "arm_detect_vlm":      lambda: _tools.arm_detect_vlm(bridge, vlm, args["target"]),
         "arm_detect_color":    lambda: _tools.arm_detect_color(bridge, args.get("color_name", ""), args.get("location_hint", "")),
+        "arm_detect_blocks":   lambda: _tools.arm_detect_blocks(bridge, args.get("location_hint", "")),
         "arm_get_3d_position": lambda: _tools.arm_get_3d_position(bridge, args["u"], args["v"]),
         "arm_get_status":      lambda: _tools.arm_get_status(bridge),
         "arm_move_joints":     lambda: _tools.arm_move_joints(bridge, args["joint_angles_deg"], args.get("timeout", 20.0)),
-        "arm_move_to_pose":    lambda: _tools.arm_move_to_pose(bridge, args["x"], args["y"], args["z"], args.get("quat"), args.get("timeout", 20.0)),
-        "arm_move_cartesian":  lambda: _tools.arm_move_cartesian(bridge, args["x"], args["y"], args["z"], args.get("quat"), args.get("timeout", 20.0)),
+        "arm_move_to_pose":    lambda: _tools.arm_move_to_pose(bridge, args["x"], args["y"], args["z"], args.get("quat"), args.get("timeout", 60.0)),
+        "arm_move_cartesian":  lambda: _tools.arm_move_cartesian(bridge, args["x"], args["y"], args["z"], args.get("quat"), args.get("timeout", 30.0)),
         "arm_control_gripper": lambda: _tools.arm_control_gripper(bridge, args["width"], args.get("duration", 1.5), args.get("timeout", 5.0)),
         "arm_go_home":         lambda: _tools.arm_go_home(bridge, args.get("timeout", 20.0)),
         "arm_stop":            lambda: _tools.arm_stop(bridge),
