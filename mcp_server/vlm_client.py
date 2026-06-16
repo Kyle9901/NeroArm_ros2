@@ -195,11 +195,8 @@ class VlmClient:
         model_name: str | None = None,
     ):
         self.api_key = api_key or os.environ.get("VLM_API_KEY", "")
-        self.api_url = api_url or os.environ.get(
-            "VLM_API_URL",
-            "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-        )
-        self.model_name = model_name or os.environ.get("VLM_MODEL", "qwen3.7-plus")
+        self.api_url = api_url or os.environ.get("VLM_API_URL", "")
+        self.model_name = model_name or os.environ.get("VLM_MODEL", "")
 
     # ── low-level VLM call ──
     def call(self, image_bgr: np.ndarray, target: str = "", prompt: str | None = None,

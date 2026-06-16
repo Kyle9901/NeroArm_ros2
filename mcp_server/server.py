@@ -47,6 +47,31 @@ from .tools import tools as _tools
 
 TOOL_DEFINITIONS = [
     {
+        "name": "arm_configure_vlm",
+        "description": "Configure VLM API settings at runtime. Use this to set or change the VLM API key, "
+                       "API URL, and model name without restarting the MCP server. "
+                       "Leave a field empty to keep its current value. "
+                       "Call this first if VLM detection fails with auth errors.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "api_key": {
+                    "type": "string",
+                    "description": "VLM API key. Leave empty to keep current.",
+                },
+                "api_url": {
+                    "type": "string",
+                    "description": "VLM API endpoint URL (OpenAI-compatible). Leave empty to keep current.",
+                },
+                "model": {
+                    "type": "string",
+                    "description": "VLM model name. Leave empty to keep current.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "arm_capture_image",
         "description": "Capture the latest colour image from the robot's eye-in-hand camera. "
                        "Returns a base64-encoded JPEG and depth statistics. "
@@ -126,7 +151,12 @@ TOOL_DEFINITIONS = [
     {
         "name": "arm_get_3d_position",
         "description": "Convert a 2D pixel coordinate (u, v) from the camera image to a 3D position "
-                       "in the robot's base_link frame. Uses the depth image and TF2 transform.",
+                       "in the robot's base_link frame. Uses the depth image and TF2 transform. "
+                       "Returns x, y, z — NOTE: z is the OBJECT SURFACE height, not the flange height. "
+                       "The flange must be ~0.175m ABOVE the surface to avoid collision. "
+                       "Do NOT pass the returned z directly to arm_move_to_pose or arm_move_cartesian — "
+                       "always add an offset (approach_height=0.26m or safe_height=0.40m). "
+                       "For pick-and-place, use arm_execute_grasp and arm_execute_place which handle offsets automatically.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -140,8 +170,10 @@ TOOL_DEFINITIONS = [
         "name": "arm_get_status",
         "description": "Get the current state of the robot arm: joint angles (degrees), gripper position, "
                        "holding state (whether gripper is currently holding an object), "
-                       "workspace bounds (x/y min/max), safe height, and desk surface Z. "
-                       "Call this before any motion sequence to check the arm's current condition.",
+                       "workspace bounds (x/y min/max), safe height, desk surface Z, "
+                       "and grasp_geometry (flange_to_tip, fingertip_overlap, grasp_depth). "
+                       "Call this before any motion sequence to check the arm's current condition "
+                       "and understand the grasp geometry parameters.",
         "inputSchema": {
             "type": "object",
             "properties": {},
@@ -173,8 +205,16 @@ TOOL_DEFINITIONS = [
     {
         "name": "arm_move_to_pose",
         "description": "Move the robot TCP to a Cartesian pose (x, y, z in metres) via MoveGroup motion planning. "
+                       "⚠️ CRITICAL: z is the FLANGE (TCP) height, NOT the gripper tip height! "
+                       "The gripper tip is ~0.175m BELOW the flange. "
+                       "The z from arm_get_3d_position is the OBJECT SURFACE height — you MUST add an offset "
+                       "(at least +0.26m approach_height or +0.40m safe_height) before passing to this tool. "
+                       "Example: if arm_get_3d_position returns z=0.05, use z=0.31 (0.05 + 0.26) to approach above the object. "
+                       "NEVER pass raw surface z to this tool — the flange would go below the desk and planning will fail. "
                        "The orientation defaults to the pre-configured grasp quaternion. "
-                       "Timeout covers planning (5 attempts × 3s) + execution.",
+                       "Timeout covers planning (5 attempts × 3s) + execution. "
+                       "For typical pick-and-place, use arm_execute_grasp and arm_execute_place instead — "
+                       "they handle z-offsets automatically.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -196,7 +236,13 @@ TOOL_DEFINITIONS = [
     {
         "name": "arm_move_cartesian",
         "description": "Move the robot TCP along a straight line in Cartesian space. "
+                       "⚠️ CRITICAL: z is the FLANGE (TCP) height, NOT the gripper tip! "
+                       "Gripper tip is ~0.175m below flange. Never pass raw surface z directly — "
+                       "if arm_get_3d_position returned z=0.05, the flange must be at least z+0.175=0.225 "
+                       "to keep the tip above the desk. Planning will fail if z is too low. "
                        "Use this for precise vertical descent / ascent. "
+                       "For typical pick-and-place, use arm_execute_grasp and arm_execute_place instead — "
+                       "they handle z-offsets automatically. "
                        "Default timeout: 30s.",
         "inputSchema": {
             "type": "object",
@@ -253,19 +299,22 @@ TOOL_DEFINITIONS = [
     {
         "name": "arm_execute_grasp",
         "description": "Pick up an object at (x, y, z) in base_link frame. "
-                       "Steps: 1) open gripper + move to approach pose, "
-                       "2) SLOW Cartesian descent to grasp, "
+                       "⚠️ z = OBJECT SURFACE HEIGHT (from arm_get_3d_position), NOT flange height. "
+                       "The tool internally handles all z-offsets: flange descends to z + grasp_depth (0.135m), "
+                       "fingertip ends up at z - fingertip_overlap (z - 0.04m = 4cm BELOW surface to grip the object). "
+                       "You do NOT need to add any offset to z — just pass the surface height directly. "
+                       "Steps: 1) open gripper + move to approach pose (z + 0.26m), "
+                       "2) SLOW Cartesian descent to grasp (z + 0.135m → fingertip at z - 0.04m), "
                        "3) close gripper + MEASURE actual gripper width, "
-                       "4) lift to safe height. "
-                       "RETURNS: 'holding' field (bool) — TRUE if the gripper stayed open after closing "
-                       "(object physically blocked it), FALSE if the gripper fully closed (nothing inside). "
-                       "TRUST this field — it is measured from the actual gripper hardware, not estimated. "
-                       "Do NOT call arm_capture_image or arm_detect_vlm to verify — the camera cannot "
-                       "reliably see the gripper after lift. "
-                       "If holding=false, the object was MISSED; either retry the grasp or report to the user. "
-                       "If holding=true, the object is held at safe height; use arm_execute_place() to put it down. "
-                       "On failure, automatically attempts recovery to safe height. "
-                       "⚠️ This will physically move the robot — ensure the workspace is clear!",
+                       "4) lift to safe height (0.40m). "
+                       "RETURNS: 'holding' field (bool) — TRUE if gripper stayed open (object inside), "
+                       "FALSE if gripper fully closed (nothing grabbed). "
+                       "TRUST holding — it's measured from hardware, not estimated. "
+                       "Do NOT call arm_capture_image or arm_detect_vlm to verify. "
+                       "If holding=false: retry grasp or tell user. "
+                       "If holding=true: use arm_execute_place() to put it down. "
+                       "Auto-recovers to safe height on failure. "
+                       "⚠️ Physically moves the robot — ensure workspace is clear!",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -322,6 +371,7 @@ def _call_tool(name: str, args: dict, bridge: RobotBridge, vlm: VlmClient) -> di
     """Dispatch tool call to the appropriate handler."""
 
     handlers = {
+        "arm_configure_vlm":   lambda: _tools.arm_configure_vlm(bridge, vlm, args.get("api_key"), args.get("api_url"), args.get("model")),
         "arm_capture_image":   lambda: _tools.arm_capture_image(bridge),
         "arm_detect_vlm":      lambda: _tools.arm_detect_vlm(bridge, vlm, args["target"]),
         "arm_detect_color":    lambda: _tools.arm_detect_color(bridge, args.get("color_name", ""), args.get("location_hint", "")),

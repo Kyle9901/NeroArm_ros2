@@ -157,6 +157,43 @@ def arm_get_3d_position(bridge: "RobotBridge", u: int, v: int) -> dict:
     }
 
 
+def arm_configure_vlm(bridge: "RobotBridge", vlm: "VlmClient",
+                      api_key: str | None = None, api_url: str | None = None,
+                      model: str | None = None) -> dict:
+    """Set VLM API key, URL, or model at runtime without restarting the MCP server."""
+    changes = []
+    if api_key is not None:
+        vlm.api_key = api_key
+        changes.append("api_key")
+    if api_url is not None:
+        vlm.api_url = api_url
+        changes.append("api_url")
+    if model is not None:
+        vlm.model_name = model
+        changes.append("model")
+
+    if not changes:
+        return {
+            "success": True,
+            "message": "No changes — provide at least one of: api_key, api_url, model",
+            "current": {
+                "api_url": vlm.api_url,
+                "model": vlm.model_name,
+                "api_key_set": bool(vlm.api_key),
+            },
+        }
+
+    return {
+        "success": True,
+        "message": f"VLM config updated: {', '.join(changes)}",
+        "current": {
+            "api_url": vlm.api_url,
+            "model": vlm.model_name,
+            "api_key_set": bool(vlm.api_key),
+        },
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════════════════════
 #   Motion tools
 # ═══════════════════════════════════════════════════════════════════════════════════════════
@@ -176,6 +213,21 @@ def arm_get_status(bridge: "RobotBridge") -> dict:
         },
         "safe_height": bridge.get_safe_height(),
         "desk_surface_z": bridge.node._get_param("desk_z_surface"),
+        "grasp_geometry": {
+            "flange_to_tip": bridge.get_flange_to_tip(),
+            "fingertip_overlap": bridge.get_fingertip_overlap(),
+            "grasp_depth": bridge.get_grasp_depth(),
+            "description": (
+                "法兰 → 指尖 = {flange_to_tip}m. "
+                "抓取时指尖探入物块表面 {overlap}m. "
+                "法兰下降高度 = 物块表面高度 + grasp_depth = 物块表面 + {grasp}m. "
+                "move_to_pose / move_cartesian 的 z 参数是法兰高度, 不是指尖高度."
+            ).format(
+                flange_to_tip=bridge.get_flange_to_tip(),
+                overlap=bridge.get_fingertip_overlap(),
+                grasp=bridge.get_grasp_depth(),
+            ),
+        },
     }
 
 

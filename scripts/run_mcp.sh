@@ -4,6 +4,7 @@
 set -e
 
 export PYTHONPATH="/home/alkaid/ros2_ws/src/vision_grasp:${PYTHONPATH}"
+export VLM_API_KEY="sk-ztI…nXH1"
 
 # ROS 2 environment
 [ -f /opt/ros/jazzy/setup.bash ] && source /opt/ros/jazzy/setup.bash

@@ -116,19 +116,21 @@ class RobotBridgeNode(Node):
         p("planning_group", "arm")
         p("tcp_link", "tcp_link")
         p("base_frame", "base_link")
-        p("grasp_quat", [0.476, 0.523, -0.523, 0.476])
+        p("grasp_quat", [0.503, 0.497, -0.499, 0.501])
         p("workspace_x_min", -0.55)
         p("workspace_x_max", 0.25)
         p("workspace_y_min", -0.55)
         p("workspace_y_max", 0.2)
         p("approach_height", 0.26)
         p("safe_height", 0.40)
-        p("grasp_depth", 0.155)     # 0.175-0.02, 预留2cm夹取空间
+        p("grasp_depth", 0.135)     # flange_to_tip - fingertip_overlap = 0.175 - 0.04
         p("place_x", -0.40)
         p("place_y", -0.25)
         p("place_z", 0.20)
         p("gripper_open_width", 0.10)
         p("gripper_close_width", 0.02)
+        p("flange_to_tip", 0.175)          # 法兰 → 夹爪指尖距离, 固定硬件参数
+        p("fingertip_overlap", 0.04)       # 抓取时指尖探入物块表面的深度, 全局可调
         p("planning_time", 3.0)
         p("num_planning_attempts", 5)
         p("velocity_scaling", 0.15)           # normal motion (approach / lift / home)
@@ -268,7 +270,7 @@ class RobotBridgeNode(Node):
             return self._color_info.copy() if self._color_info else None
 
     # ─────────────────────────── 3D reconstruction ────────────────
-    def compute_3d(self, u: int, v: int, depth_img: np.ndarray, margin_px: int = 5) -> dict | None:
+    def compute_3d(self, u: int, v: int, depth_img: np.ndarray, margin_px: int = 2) -> dict | None:
         """
         Given 2D pixel (u,v) and aligned depth_img (16UC1, mm),
         compute 3D point in camera optical frame.
@@ -749,6 +751,12 @@ class RobotBridge:
 
     def get_gripper_close_width(self) -> float:
         return self.node._get_param("gripper_close_width")
+
+    def get_flange_to_tip(self) -> float:
+        return self.node._get_param("flange_to_tip")
+
+    def get_fingertip_overlap(self) -> float:
+        return self.node._get_param("fingertip_overlap")
 
     def get_velocity_scaling(self) -> float:
         return self.node._get_param("velocity_scaling")
