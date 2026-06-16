@@ -57,25 +57,28 @@ class GraspExecutorNode(Node):
 
         # 实测抓取姿态四元数 (x, y, z, w)
         # 来自 tf2_echo base_link tcp_link，垂直向下抓取
-        self.declare_parameter('grasp_quat', [0.476, 0.523, -0.523, 0.476])
+        self.declare_parameter('grasp_quat', [0.503, 0.497, -0.499, 0.501])
 
-        self.declare_parameter('table_z_threshold', 0.05)
         self.declare_parameter('workspace_x_min', -0.55)
         self.declare_parameter('workspace_x_max', 0.25)
         self.declare_parameter('workspace_y_min', -0.55)
         self.declare_parameter('workspace_y_max', 0.2)
-        self.declare_parameter('approach_height', 0.26)       # 预抓位: 物块上方26cm (法兰位置)
-        self.declare_parameter('safe_height', 0.40)            # 安全位法兰 Z
-        self.declare_parameter('grasp_depth', 0.175 - 0.02)          # 抓取位: 法兰在物块上方17.5cm
-        self.declare_parameter('place_x', -0.40)               # 放置位法兰点 X
-        self.declare_parameter('place_y', -0.25)               # 放置位法兰点 Y
-        self.declare_parameter('place_z', 0.20)                # 放置位法兰点 Z
+        self.declare_parameter('approach_height', 0.26)
+        self.declare_parameter('safe_height', 0.40)
+        self.declare_parameter('grasp_depth', 0.135)
+        self.declare_parameter('fingertip_overlap', 0.04)
+        self.declare_parameter('flange_to_tip', 0.175)
+        self.declare_parameter('place_x', -0.40)
+        self.declare_parameter('place_y', -0.25)
+        self.declare_parameter('place_z', 0.20)
         self.declare_parameter('gripper_open_width', 0.10)
         self.declare_parameter('gripper_close_width', 0.02)
-        self.declare_parameter('planning_time', 5.0)
-        self.declare_parameter('num_planning_attempts', 20)
-        self.declare_parameter('velocity_scaling', 0.05)
-        self.declare_parameter('accel_scaling', 0.05)
+        self.declare_parameter('planning_time', 3.0)
+        self.declare_parameter('num_planning_attempts', 5)
+        self.declare_parameter('velocity_scaling', 0.15)
+        self.declare_parameter('accel_scaling', 0.15)
+        self.declare_parameter('descent_velocity_scaling', 0.05)
+        self.declare_parameter('descent_accel_scaling', 0.05)
         self.declare_parameter('cartesian_eef_step', 0.005)
         self.declare_parameter('cartesian_min_fraction', 0.5)
         self.declare_parameter('cartesian_jump_threshold', 2.0)
@@ -88,7 +91,6 @@ class GraspExecutorNode(Node):
         self.tcp_link = g('tcp_link').value
         self.base_frame = g('base_frame').value
         self.grasp_quat = self._normalize_quat(list(g('grasp_quat').value))
-        self.table_z_threshold = g('table_z_threshold').value
         self.workspace_x_min = g('workspace_x_min').value
         self.workspace_x_max = g('workspace_x_max').value
         self.workspace_y_min = g('workspace_y_min').value
@@ -96,6 +98,8 @@ class GraspExecutorNode(Node):
         self.approach_height = g('approach_height').value
         self.safe_height = g('safe_height').value
         self.grasp_depth = g('grasp_depth').value
+        self.fingertip_overlap = g('fingertip_overlap').value
+        self.flange_to_tip = g('flange_to_tip').value
         self.place_x = g('place_x').value
         self.place_y = g('place_y').value
         self.place_z = g('place_z').value
@@ -105,6 +109,8 @@ class GraspExecutorNode(Node):
         self.num_planning_attempts = g('num_planning_attempts').value
         self.velocity_scaling = g('velocity_scaling').value
         self.accel_scaling = g('accel_scaling').value
+        self.descent_velocity_scaling = g('descent_velocity_scaling').value
+        self.descent_accel_scaling = g('descent_accel_scaling').value
         self.cartesian_eef_step = g('cartesian_eef_step').value
         self.cartesian_min_fraction = g('cartesian_min_fraction').value
         self.cartesian_jump_threshold = g('cartesian_jump_threshold').value
@@ -156,8 +162,6 @@ class GraspExecutorNode(Node):
         self._wait_servers()
 
         self.get_logger().info('抓取执行节点已启动')
-        self.get_logger().info(
-            f'等待 /grasp/target，frame={self.base_frame}，Z_min={self.table_z_threshold:.3f}m')
 
     # ─────────────────────────── 参数校验 ───────────────────────────
     def _normalize_quat(self, quat):

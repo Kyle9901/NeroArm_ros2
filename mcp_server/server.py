@@ -1,40 +1,24 @@
 #!/usr/bin/env python3
 """
 MCP Server for AGX Robot Arm — launch via OpenClaw / Claude Code.
-
-Usage:
-    python -m vision_grasp.mcp_server.server
-
-Environment variables:
-    VLM_API_KEY        — required for VLM detection
-    VLM_API_URL        — optional, defaults to Qwen dashscope
-    VLM_MODEL          — optional, defaults to qwen3.7-plus
-    VLM_DEBUG_DIR      — optional, saves debug image
+Usage: python -m mcp_server.server
 """
 
 import asyncio
 import json
 import os
 import sys
-import threading
 import traceback
 from typing import Any
 
-# ── Ensure parent package is importable ──
+# Ensure parent package is importable
 _pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _pkg_dir not in sys.path:
     sys.path.insert(0, _pkg_dir)
 
-# ── Try to import mcp (official SDK) ──
-try:
-    from mcp.server import Server
-    from mcp.server.stdio import stdio_server
-    from mcp.types import Tool, TextContent
-    MCP_AVAILABLE = True
-except ImportError:
-    MCP_AVAILABLE = False
-    print("WARNING: 'mcp' package not installed. Install with: pip install mcp", file=sys.stderr)
-    print("Falling back to raw JSON-RPC stdio mode.", file=sys.stderr)
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+from mcp.types import Tool, TextContent
 
 from .ros_bridge import RobotBridge
 from .vlm_client import VlmClient
@@ -359,17 +343,9 @@ TOOL_DEFINITIONS = [
     },
 ]
 
-# Lookup table for fast dispatch
-TOOL_TABLE = {t["name"]: t for t in TOOL_DEFINITIONS}
-
-
-# ═══════════════════════════════════════════════════════════════════════════════════════════
-#   Tool dispatch
-# ═══════════════════════════════════════════════════════════════════════════════════════════
+# ── Tool dispatch ──
 
 def _call_tool(name: str, args: dict, bridge: RobotBridge, vlm: VlmClient) -> dict:
-    """Dispatch tool call to the appropriate handler."""
-
     handlers = {
         "arm_configure_vlm":   lambda: _tools.arm_configure_vlm(bridge, vlm, args.get("api_key"), args.get("api_url"), args.get("model")),
         "arm_capture_image":   lambda: _tools.arm_capture_image(bridge),
@@ -387,153 +363,50 @@ def _call_tool(name: str, args: dict, bridge: RobotBridge, vlm: VlmClient) -> di
         "arm_execute_grasp":   lambda: _tools.arm_execute_grasp(bridge, args["x"], args["y"], args["z"], args.get("quat")),
         "arm_execute_place":   lambda: _tools.arm_execute_place(bridge, args["x"], args["y"], args["z"], args.get("quat")),
     }
-
     if name not in handlers:
         return {"success": False, "error": f"Unknown tool: {name}"}
-
     try:
         return handlers[name]()
     except Exception as e:
         return {"success": False, "error": f"{type(e).__name__}: {e}", "traceback": traceback.format_exc()}
 
 
-# ═══════════════════════════════════════════════════════════════════════════════════════════
-#   MCP SDK mode
-# ═══════════════════════════════════════════════════════════════════════════════════════════
-
-if MCP_AVAILABLE:
-
-    async def _run_mcp_server():
-        server = Server("robot-arm")
-
-        @server.list_tools()
-        async def list_tools() -> list[Tool]:
-            return [Tool(**t) for t in TOOL_DEFINITIONS]
-
-        @server.call_tool()
-        async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-            result = _call_tool(name, arguments, _bridge, _vlm)
-            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
-
-        async with stdio_server() as (read_stream, write_stream):
-            await server.run(read_stream, write_stream, server.create_initialization_options())
-
-
-# ═══════════════════════════════════════════════════════════════════════════════════════════
-#   Raw JSON-RPC mode (fallback when mcp package is not installed)
-# ═══════════════════════════════════════════════════════════════════════════════════════════
-
-def _run_jsonrpc_loop():
-    """Minimal JSON-RPC 2.0 loop over stdin/stdout.  Compatible with MCP clients."""
-    import select
-
-    buf = ""
-    while True:
-        # Read a line
-        if sys.stdin.isatty():
-            # Non-interactive — just read
-            chunk = sys.stdin.readline()
-            if not chunk:
-                break
-        else:
-            ready, _, _ = select.select([sys.stdin], [], [], 0.5)
-            if not ready:
-                continue
-            chunk = sys.stdin.readline()
-            if not chunk:
-                break
-
-        buf += chunk
-        # Try to parse complete JSON lines
-        while "\n" in buf:
-            line, buf = buf.split("\n", 1)
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                req = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            resp = _handle_jsonrpc(req)
-            if resp is not None:
-                sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
-                sys.stdout.flush()
-
-
-def _handle_jsonrpc(req: dict) -> dict | None:
-    """Handle a single JSON-RPC 2.0 request."""
-    req_id = req.get("id")
-    method = req.get("method", "")
-    params = req.get("params", {})
-
-    if method == "initialize":
-        return {
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "serverInfo": {"name": "robot-arm", "version": "0.0.1"},
-                "capabilities": {"tools": {}},
-            },
-        }
-    elif method == "notifications/initialized":
-        return None  # No response for notifications
-    elif method == "tools/list":
-        return {
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {"tools": TOOL_DEFINITIONS},
-        }
-    elif method == "tools/call":
-        name = params.get("name", "")
-        arguments = params.get("arguments", {})
-        result = _call_tool(name, arguments, _bridge, _vlm)
-        return {
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {
-                "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}],
-            },
-        }
-    elif method == "ping":
-        return {"jsonrpc": "2.0", "id": req_id, "result": {}}
-    else:
-        return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
-
-
-# ═══════════════════════════════════════════════════════════════════════════════════════════
-#   Entry point
-# ═══════════════════════════════════════════════════════════════════════════════════════════
+# ── MCP server ──
 
 _bridge: RobotBridge | None = None
 _vlm: VlmClient | None = None
 
 
-def main():
+async def _async_main():
     global _bridge, _vlm
-
     print("[robot-arm] Starting MCP server...", file=sys.stderr)
-
-    # Init VLM client
     _vlm = VlmClient()
     if not _vlm.api_key:
-        print("[robot-arm] WARNING: VLM_API_KEY not set — VLM detection will fail.", file=sys.stderr)
-
-    # Init ROS bridge
+        print("[robot-arm] WARNING: VLM_API_KEY not set.", file=sys.stderr)
     _bridge = RobotBridge()
     print("[robot-arm] Connecting to ROS 2...", file=sys.stderr)
     _bridge.start()
     print("[robot-arm] ROS 2 bridge ready.", file=sys.stderr)
 
-    if MCP_AVAILABLE:
-        print("[robot-arm] Running with MCP SDK (stdio transport)", file=sys.stderr)
-        asyncio.run(_run_mcp_server())
-    else:
-        print("[robot-arm] Running with raw JSON-RPC 2.0 (stdio transport)", file=sys.stderr)
-        _run_jsonrpc_loop()
+    server = Server("robot-arm")
 
-    _bridge.shutdown()
+    @server.list_tools()
+    async def list_tools() -> list[Tool]:
+        return [Tool(**t) for t in TOOL_DEFINITIONS]
+
+    @server.call_tool()
+    async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+        result = _call_tool(name, arguments, _bridge, _vlm)
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+
+    async with stdio_server() as (read_stream, write_stream):
+        await server.run(read_stream, write_stream, server.create_initialization_options())
+
+
+def main():
+    asyncio.run(_async_main())
+    if _bridge:
+        _bridge.shutdown()
     print("[robot-arm] Server stopped.", file=sys.stderr)
 
 

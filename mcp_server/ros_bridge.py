@@ -38,8 +38,6 @@ from shape_msgs.msg import SolidPrimitive
 from tf2_geometry_msgs import do_transform_point
 from tf2_ros import Buffer, TransformListener
 
-from .vlm_client import VlmClient
-
 # ─────────────────────────── constants ───────────────────────────
 ARM_JOINT_NAMES = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"]
 GRIPPER_JOINT_NAMES = ["gripper_joint1", "gripper_joint2"]
@@ -397,37 +395,26 @@ class RobotBridgeNode(Node):
         otol = self._get_param("ori_tolerance")
         base = self._get_param("base_frame")
         tcp = self._get_param("tcp_link")
-
-        from geometry_msgs.msg import Vector3 as V3
-
-        pc = _ma.PositionConstraint() if hasattr(_ma, "PositionConstraint") else __import__("moveit_msgs.msg", fromlist=["PositionConstraint"]).PositionConstraint()
+        from geometry_msgs.msg import Vector3
         from moveit_msgs.msg import PositionConstraint as PC, OrientationConstraint as OC
+
         pc = PC()
         pc.header.frame_id = base
         pc.link_name = tcp
-        pc.target_point_offset = V3(x=0.0, y=0.0, z=0.0)
-        prim = SolidPrimitive()
-        prim.type = SolidPrimitive.SPHERE
-        prim.dimensions = [ptol]
+        pc.target_point_offset = Vector3(x=0.0, y=0.0, z=0.0)
+        prim = SolidPrimitive(); prim.type = SolidPrimitive.SPHERE; prim.dimensions = [ptol]
         pc.constraint_region.primitives.append(prim)
-        rp = Pose()
-        rp.position.x = float(x)
-        rp.position.y = float(y)
-        rp.position.z = float(z)
+        rp = Pose(); rp.position.x = float(x); rp.position.y = float(y); rp.position.z = float(z)
         rp.orientation.w = 1.0
         pc.constraint_region.primitive_poses.append(rp)
         pc.weight = 1.0
         c.position_constraints.append(pc)
 
         oc = OC()
-        oc.header.frame_id = base
-        oc.link_name = tcp
-        oc.orientation.x = float(quat[0])
-        oc.orientation.y = float(quat[1])
-        oc.orientation.z = float(quat[2])
-        oc.orientation.w = float(quat[3])
-        oc.absolute_x_axis_tolerance = otol
-        oc.absolute_y_axis_tolerance = otol
+        oc.header.frame_id = base; oc.link_name = tcp
+        oc.orientation.x = float(quat[0]); oc.orientation.y = float(quat[1])
+        oc.orientation.z = float(quat[2]); oc.orientation.w = float(quat[3])
+        oc.absolute_x_axis_tolerance = otol; oc.absolute_y_axis_tolerance = otol
         oc.absolute_z_axis_tolerance = otol
         oc.weight = 1.0
         c.orientation_constraints.append(oc)

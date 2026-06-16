@@ -6,6 +6,7 @@ Stateless: takes image + target, returns detection result.
 import base64
 import json
 import os
+import time
 
 import cv2
 import numpy as np
@@ -185,6 +186,27 @@ PROMPT_TEMPLATE = (
 
 
 # ─────────────────────────── Public API ─────────────────────────────────────────────────────
+_DEFAULT_API_KEY = "sk-HI22XB2pGNy2IKcxmfgvVHMB1hNzAdWgtYax2fkI2Oo6FaLn"
+_DEFAULT_API_URL = "http://8.153.64.170:6102/v1/chat/completions"
+_DEFAULT_MODEL = "qwen-vl-max"
+_DEFAULT_DEBUG_DIR = "/tmp/vlm_debug"
+
+
+def _draw_bboxes(img: np.ndarray, bboxes: list[list[int]], labels: list[str] | None = None) -> np.ndarray:
+    """Draw bounding boxes on an image. bboxes: list of [xmin, ymin, xmax, ymax]."""
+    out = img.copy()
+    colors = [(0, 255, 0), (255, 0, 0), (0, 255, 255), (255, 255, 0), (255, 0, 255), (0, 128, 255)]
+    for i, b in enumerate(bboxes):
+        color = colors[i % len(colors)]
+        cv2.rectangle(out, (b[0], b[1]), (b[2], b[3]), color, 2)
+        cx, cy = (b[0] + b[2]) // 2, (b[1] + b[3]) // 2
+        cv2.circle(out, (cx, cy), 4, color, -1)
+        if labels and i < len(labels):
+            cv2.putText(out, labels[i], (b[0], b[1] - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    return out
+
+
 class VlmClient:
     """Stateless VLM client — wraps Qwen / GPT-4V API call + OpenCV colour fallback."""
 
@@ -193,10 +215,22 @@ class VlmClient:
         api_key: str | None = None,
         api_url: str | None = None,
         model_name: str | None = None,
+        debug_dir: str | None = None,
     ):
-        self.api_key = api_key or os.environ.get("VLM_API_KEY", "")
-        self.api_url = api_url or os.environ.get("VLM_API_URL", "")
-        self.model_name = model_name or os.environ.get("VLM_MODEL", "")
+        self.api_key = api_key or os.environ.get("VLM_API_KEY") or _DEFAULT_API_KEY
+        self.api_url = api_url or os.environ.get("VLM_API_URL") or _DEFAULT_API_URL
+        self.model_name = model_name or os.environ.get("VLM_MODEL") or _DEFAULT_MODEL
+        self.debug_dir = debug_dir or os.environ.get("VLM_DEBUG_DIR") or _DEFAULT_DEBUG_DIR
+        os.makedirs(self.debug_dir, exist_ok=True)
+
+    def _save_debug(self, image_bgr: np.ndarray, bboxes: list[list[int]],
+                    labels: list[str] | None = None, prefix: str = "detect") -> str:
+        """Save image with bboxes drawn. Returns file path."""
+        annotated = _draw_bboxes(image_bgr, bboxes, labels)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(self.debug_dir, f"{prefix}_{ts}.jpg")
+        cv2.imwrite(path, annotated)
+        return path
 
     # ── low-level VLM call ──
     def call(self, image_bgr: np.ndarray, target: str = "", prompt: str | None = None,
@@ -307,6 +341,10 @@ class VlmClient:
         cx = int((xmin + xmax) / 2)
         cy = int((ymin + ymax) / 2)
 
+        debug_path = self._save_debug(image_bgr, [[xmin, ymin, xmax, ymax]],
+                                       labels=[f"{category}:{raw.get('color', '')}"],
+                                       prefix="detect")
+
         return {
             "found": True,
             "category": category,
@@ -314,4 +352,5 @@ class VlmClient:
             "center_2d": [cx, cy],
             "color": raw.get("color"),
             "source": source,
+            "debug_image": debug_path,
         }

@@ -1,9 +1,8 @@
 """
 MCP tool implementations — pure functions that call RobotBridge or VlmClient.
-
-Each tool function returns a JSON-serialisable dict.
 """
 
+import os
 import sys
 import time
 from typing import TYPE_CHECKING
@@ -13,146 +12,131 @@ if TYPE_CHECKING:
     from ..vlm_client import VlmClient
 
 
-# ═══════════════════════════════════════════════════════════════════════════════════════════
-#   Vision tools
-# ═══════════════════════════════════════════════════════════════════════════════════════════
+_DEBUG_DIR = os.environ.get("VLM_DEBUG_DIR", "/tmp/vlm_debug")
+
+
+def _log(msg: str) -> None:
+    print(f"[robot-arm] {msg}", file=sys.stderr, flush=True)
+
+
+def _get_image(bridge: "RobotBridge", timeout=3.0):
+    """Capture latest color+depth pair, or return error dict."""
+    pair = bridge.node.get_latest_images(timeout=timeout)
+    if pair is None:
+        return None, {"success": False, "error": "No image — camera may not be running"}
+    return pair, None
+
+
+def _save_debug(img, bboxes, labels, prefix="detect") -> str:
+    """Draw bboxes on image, save to disk, return path."""
+    import cv2
+    from ..vlm_client import _draw_bboxes
+    os.makedirs(_DEBUG_DIR, exist_ok=True)
+    annotated = _draw_bboxes(img, bboxes, labels)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(_DEBUG_DIR, f"{prefix}_{ts}.jpg")
+    cv2.imwrite(path, annotated)
+    return path
+
+
+# ══════════════════════════════════════════════════
+#  Vision tools
+# ══════════════════════════════════════════════════
 
 def arm_capture_image(bridge: "RobotBridge") -> dict:
-    """Capture latest colour + depth image from eye-in-hand camera."""
-    pair = bridge.node.get_latest_images(timeout=3.0)
-    if pair is None:
-        return {"success": False, "error": "No image received within 3s. "
-                "Check: (1) camera is powered and publishing, "
-                "(2) /camera/color/image_raw and /camera/depth/image_raw topics are active"}
+    pair, err = _get_image(bridge)
+    if err:
+        return err
     color, depth = pair
-    import base64
-    import cv2
+    import base64, cv2
     ok, buf = cv2.imencode(".jpg", color)
     if not ok:
-        return {"success": False, "error": "JPEG encode failed — image may be corrupt"}
+        return {"success": False, "error": "JPEG encode failed"}
     b64 = base64.b64encode(buf).decode()
     return {
-        "success": True,
-        "image_base64": b64,
-        "width": color.shape[1],
-        "height": color.shape[0],
-        "channels": 3,
+        "success": True, "image_base64": b64,
+        "width": color.shape[1], "height": color.shape[0], "channels": 3,
         "depth_mean_mm": float(depth[depth > 0].mean()) if (depth > 0).any() else None,
     }
 
 
 def arm_detect_vlm(bridge: "RobotBridge", vlm: "VlmClient", target: str) -> dict:
-    """Detect an object in the current camera frame using VLM + OpenCV fallback."""
-    pair = bridge.node.get_latest_images(timeout=3.0)
-    if pair is None:
-        return {"success": False, "error": "No image received within 3s — camera may not be running"}
-    color, _depth = pair
-
+    pair, err = _get_image(bridge)
+    if err:
+        return err
+    img = pair[0]
     try:
-        result = vlm.detect(color, target)
+        result = vlm.detect(img, target)
     except Exception as e:
         return {"success": False, "error": f"VLM detection failed: {e}"}
-
     if result is None or not result.get("found"):
-        return {"success": True, "found": False,
-                "message": f"Object '{target}' not found in image. "
-                "This is a normal detection result, not a tool failure. "
-                "Suggestions: (1) call arm_go_home first for an unobstructed view, "
-                "(2) use a simpler description like 'blue block', "
-                "(3) try arm_detect_color if it's a solid-colour block, "
-                "(4) check if the object is in the camera's field of view",
-                "retryable": False}
-
+        return {
+            "success": True, "found": False, "retryable": False,
+            "message": f"Object '{target}' not found. "
+            "Try arm_go_home first, use a simpler description, "
+            "or arm_detect_color for solid-colour blocks.",
+        }
+    # result already includes debug_image from VlmClient.detect()
     return {"success": True, **result}
 
 
 def arm_detect_color(bridge: "RobotBridge", color_name: str, location_hint: str = "") -> dict:
-    """Detect a colour block using OpenCV HSV colour detection."""
     from ..vlm_client import detect_by_color
-
-    pair = bridge.node.get_latest_images(timeout=3.0)
-    if pair is None:
-        return {"success": False, "error": "No image received — camera may not be running"}
-    color, _depth = pair
-
-    bbox = detect_by_color(color, color_name, location_hint)
+    pair, err = _get_image(bridge)
+    if err:
+        return err
+    bbox = detect_by_color(pair[0], color_name, location_hint)
     if bbox is None:
-        supported = ", ".join(["blue", "red", "green", "yellow", "purple", "orange", "cyan"])
-        return {"success": True, "found": False,
-                "message": f"No {color_name} block found in current image. "
-                "This is a normal detection result, not a tool failure. "
-                f"Supported colours: {supported}. "
-                "Do not retry other colours just to search all blocks — use arm_detect_blocks instead.",
-                "retryable": False}
-
+        colors = "blue, red, green, yellow, purple, orange, cyan"
+        return {
+            "success": True, "found": False, "retryable": False,
+            "message": f"No {color_name} block found. Supported: {colors}. "
+            "Use arm_detect_blocks to scan all blocks at once.",
+        }
     xmin, ymin, xmax, ymax = bbox
-    cx = int((xmin + xmax) / 2)
-    cy = int((ymin + ymax) / 2)
+    debug_path = _save_debug(pair[0], [[xmin, ymin, xmax, ymax]], [color_name])
     return {
-        "success": True,
-        "found": True,
-        "color": color_name,
+        "success": True, "found": True, "color": color_name,
         "bbox": [xmin, ymin, xmax, ymax],
-        "center_2d": [cx, cy],
+        "center_2d": [int((xmin + xmax) / 2), int((ymin + ymax) / 2)],
+        "debug_image": debug_path,
     }
 
 
 def arm_detect_blocks(bridge: "RobotBridge", location_hint: str = "") -> dict:
-    """Detect all visible solid-colour blocks in one camera frame."""
     from ..vlm_client import detect_all_color_blocks
-
-    pair = bridge.node.get_latest_images(timeout=3.0)
-    if pair is None:
-        return {"success": False, "error": "No image received — camera may not be running"}
-    color, _depth = pair
-
-    blocks = detect_all_color_blocks(color, location_hint)
+    pair, err = _get_image(bridge)
+    if err:
+        return err
+    blocks = detect_all_color_blocks(pair[0], location_hint)
     if not blocks:
         return {
-            "success": True,
-            "found": False,
-            "count": 0,
-            "blocks": [],
-            "message": "No solid-colour blocks found in the current image. This is not a tool failure. Try arm_go_home for a clearer top-down view.",
-            "retryable": False,
+            "success": True, "found": False, "count": 0, "blocks": [], "retryable": False,
+            "message": "No blocks found. Try arm_go_home for a clearer view.",
         }
-
+    bboxes = [b["bbox"] for b in blocks]
+    labels = [b["color"] for b in blocks]
+    debug_path = _save_debug(pair[0], bboxes, labels)
     return {
-        "success": True,
-        "found": True,
-        "count": len(blocks),
-        "blocks": blocks,
-        "message": f"Detected {len(blocks)} visible colour block(s)",
+        "success": True, "found": True, "count": len(blocks), "blocks": blocks,
+        "debug_image": debug_path,
     }
 
 
 def arm_get_3d_position(bridge: "RobotBridge", u: int, v: int) -> dict:
-    """Convert 2D pixel (u,v) to 3D position in base_link frame."""
-    pair = bridge.node.get_latest_images(timeout=3.0)
-    if pair is None:
-        return {"success": False, "error": "No image received — camera may not be running"}
-    _color, depth = pair
-
-    cam3d = bridge.node.compute_3d(u, v, depth)
+    pair, err = _get_image(bridge)
+    if err:
+        return err
+    cam3d = bridge.node.compute_3d(u, v, pair[1])
     if cam3d is None:
-        return {"success": False, "error": f"No valid depth data at pixel ({u},{v}). "
-                "The point may be outside the image bounds or in a depth hole. "
-                "Try adjusting the pixel coordinates slightly"}
-
+        return {"success": False, "error": f"No valid depth at ({u},{v}). Try adjusting pixel coords."}
     try:
         base = bridge.node.transform_to_base(cam3d["x_c"], cam3d["y_c"], cam3d["z_c"])
     except Exception as e:
-        return {"success": False,
-                "error": f"TF transform from camera to base_link failed: {e}. "
-                "Check that TF2 is running and the camera_frame transform is published"}
-
+        return {"success": False, "error": f"TF transform failed: {e}. Check TF2 is running."}
     return {
-        "success": True,
-        "x": base["x"],
-        "y": base["y"],
-        "z": base["z"],
-        "frame_id": "base_link",
-        "depth_mm": cam3d["depth_mm"],
+        "success": True, "x": base["x"], "y": base["y"], "z": base["z"],
+        "frame_id": "base_link", "depth_mm": cam3d["depth_mm"],
         "valid_depth_points": cam3d["valid_points"],
     }
 
@@ -160,56 +144,29 @@ def arm_get_3d_position(bridge: "RobotBridge", u: int, v: int) -> dict:
 def arm_configure_vlm(bridge: "RobotBridge", vlm: "VlmClient",
                       api_key: str | None = None, api_url: str | None = None,
                       model: str | None = None) -> dict:
-    """Set VLM API key, URL, or model at runtime without restarting the MCP server."""
     changes = []
     if api_key is not None:
-        vlm.api_key = api_key
-        changes.append("api_key")
+        vlm.api_key = api_key; changes.append("api_key")
     if api_url is not None:
-        vlm.api_url = api_url
-        changes.append("api_url")
+        vlm.api_url = api_url; changes.append("api_url")
     if model is not None:
-        vlm.model_name = model
-        changes.append("model")
-
-    if not changes:
-        return {
-            "success": True,
-            "message": "No changes — provide at least one of: api_key, api_url, model",
-            "current": {
-                "api_url": vlm.api_url,
-                "model": vlm.model_name,
-                "api_key_set": bool(vlm.api_key),
-            },
-        }
-
-    return {
-        "success": True,
-        "message": f"VLM config updated: {', '.join(changes)}",
-        "current": {
-            "api_url": vlm.api_url,
-            "model": vlm.model_name,
-            "api_key_set": bool(vlm.api_key),
-        },
-    }
+        vlm.model_name = model; changes.append("model")
+    cur = {"api_url": vlm.api_url, "model": vlm.model_name, "api_key_set": bool(vlm.api_key)}
+    return {"success": True, "message": f"Updated: {', '.join(changes)}" if changes else "No changes", "current": cur}
 
 
-# ═══════════════════════════════════════════════════════════════════════════════════════════
-#   Motion tools
-# ═══════════════════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
+#  Motion tools
+# ══════════════════════════════════════════════════
 
 def arm_get_status(bridge: "RobotBridge") -> dict:
-    """Get current state: joint angles, gripper position, holding state, workspace bounds."""
     js = bridge.node.get_joint_state()
     return {
-        "success": True,
-        **js,
+        "success": True, **js,
         "holding": bridge.get_holding(),
         "workspace": {
-            "x_min": bridge.node._workspace_x_min,
-            "x_max": bridge.node._workspace_x_max,
-            "y_min": bridge.node._workspace_y_min,
-            "y_max": bridge.node._workspace_y_max,
+            "x_min": bridge.node._workspace_x_min, "x_max": bridge.node._workspace_x_max,
+            "y_min": bridge.node._workspace_y_min, "y_max": bridge.node._workspace_y_max,
         },
         "safe_height": bridge.get_safe_height(),
         "desk_surface_z": bridge.node._get_param("desk_z_surface"),
@@ -217,138 +174,82 @@ def arm_get_status(bridge: "RobotBridge") -> dict:
             "flange_to_tip": bridge.get_flange_to_tip(),
             "fingertip_overlap": bridge.get_fingertip_overlap(),
             "grasp_depth": bridge.get_grasp_depth(),
-            "description": (
-                "法兰 → 指尖 = {flange_to_tip}m. "
-                "抓取时指尖探入物块表面 {overlap}m. "
-                "法兰下降高度 = 物块表面高度 + grasp_depth = 物块表面 + {grasp}m. "
-                "move_to_pose / move_cartesian 的 z 参数是法兰高度, 不是指尖高度."
-            ).format(
-                flange_to_tip=bridge.get_flange_to_tip(),
-                overlap=bridge.get_fingertip_overlap(),
-                grasp=bridge.get_grasp_depth(),
-            ),
         },
     }
 
 
 def arm_move_joints(bridge: "RobotBridge", joint_angles_deg: list[float], timeout: float = 20.0) -> dict:
-    """Move arm to joint-space target.  joint_angles_deg: [j1, j2, j3, j4, j5, j6, j7] in degrees."""
     ok, msg = bridge.node.move_joints(joint_angles_deg, timeout)
     return {"success": ok, "message": msg}
 
 
-def arm_move_to_pose(
-    bridge: "RobotBridge",
-    x: float, y: float, z: float,
-    quat: list[float] | None = None,
-    timeout: float = 20.0,
-) -> dict:
-    """Move TCP to Cartesian pose via MoveGroup."""
+def arm_move_to_pose(bridge: "RobotBridge", x: float, y: float, z: float,
+                     quat: list[float] | None = None, timeout: float = 60.0) -> dict:
     ok, msg = bridge.node.move_to_pose(x, y, z, quat, timeout)
     return {"success": ok, "message": msg}
 
 
-def arm_move_cartesian(
-    bridge: "RobotBridge",
-    x: float, y: float, z: float,
-    quat: list[float] | None = None,
-    timeout: float = 20.0,
-) -> dict:
-    """Straight-line Cartesian motion from current pose to target."""
+def arm_move_cartesian(bridge: "RobotBridge", x: float, y: float, z: float,
+                       quat: list[float] | None = None, timeout: float = 30.0) -> dict:
     ok, msg = bridge.node.move_cartesian(x, y, z, quat, timeout)
     return {"success": ok, "message": msg}
 
 
 def arm_control_gripper(bridge: "RobotBridge", width: float, duration: float = 1.5, timeout: float = 5.0) -> dict:
-    """Open/close gripper.  width in metres: 0.10 = open, 0.02 = close."""
     ok, msg = bridge.node.control_gripper(width, duration, timeout)
     return {"success": ok, "message": msg}
 
 
 def arm_go_home(bridge: "RobotBridge", timeout: float = 20.0) -> dict:
-    """Move arm to home joint configuration."""
     ok, msg = bridge.node.go_home(timeout)
     return {"success": ok, "message": msg}
 
 
 def arm_stop(bridge: "RobotBridge") -> dict:
-    """Emergency stop — cancel all active motion goals immediately."""
     ok, msg = bridge.emergency_stop()
     return {"success": ok, "message": msg}
 
 
-# ═══════════════════════════════════════════════════════════════════════════════════════════
-#   Sequence tools
-# ═══════════════════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
+#  Sequence tools
+# ══════════════════════════════════════════════════
 
 def _recover_to_safe(bridge: "RobotBridge", x: float, y: float, safe_h: float, quat: list[float]) -> bool:
-    """Best-effort recovery: lift to safe height. Returns True if successful."""
+    """Best-effort recovery: cartesian lift → planned lift → go_home → emergency_stop."""
     node = bridge.node
     _log("RECOVERY: attempting to lift to safe height")
-    # Try cartesian lift first (precise), fall back to joint-space planning
-    ok, _ = node.move_cartesian(x, y, safe_h, quat)
-    if ok:
-        _log("RECOVERY: cartesian lift successful")
-        return True
-    ok, _ = node.move_to_pose(x, y, safe_h, quat)
-    if ok:
-        _log("RECOVERY: planned lift successful")
-        return True
-    # Last resort: go home
-    _log("RECOVERY: trying go_home as last resort")
-    ok, _ = node.go_home(timeout=20.0)
-    if ok:
-        return True
-    # Nothing worked — emergency stop
+    for label, fn in [("cartesian lift", lambda: node.move_cartesian(x, y, safe_h, quat)),
+                       ("planned lift", lambda: node.move_to_pose(x, y, safe_h, quat)),
+                       ("go_home", lambda: node.go_home(timeout=20.0))]:
+        ok, _ = fn()
+        if ok:
+            _log(f"RECOVERY: {label} successful")
+            return True
+        _log(f"RECOVERY: {label} failed, trying next")
     _log("RECOVERY: all attempts failed — EMERGENCY STOP")
     node.emergency_stop()
     return False
 
 
-def _log(msg: str) -> None:
-    """Write progress message to stderr so OpenClaw/LLM can see intermediate progress."""
-    print(f"[robot-arm] {msg}", file=sys.stderr, flush=True)
-
-
-def arm_execute_grasp(
-    bridge: "RobotBridge",
-    x: float, y: float, z: float,
-    quat: list[float] | None = None,
-) -> dict:
+def arm_execute_grasp(bridge: "RobotBridge", x: float, y: float, z: float,
+                      quat: list[float] | None = None) -> dict:
     """
     Pick up an object at (x, y, z) in base_link frame.
-
-    Steps:
-      1. Open gripper + move to approach pose (above target)
-      2. Cartesian descent to grasp pose (SLOW, precise speed)
-      3. Close gripper
-      4. Check actual gripper width — if closed → no object picked up
-      5. Lift to safe height
-
-    On failure, attempts recovery to safe height then returns error.
-    After success, the object is held at safe height.
-    Use arm_execute_place() to put it down.
+    z = object SURFACE height (from arm_get_3d_position). All z-offsets handled internally.
+    Steps: 1) open gripper + approach (z+0.26m)  2) SLOW descent to grasp (z+0.135m → fingertip at z-0.04m)
+           3) close gripper  4) measure gripper width  5) lift to safe height (0.40m).
+    Returns holding=True if object physically blocked gripper closure, False if fully closed.
+    On failure, auto-recovers to safe height.
     """
     t0 = time.monotonic()
-
     if quat is None:
         quat = bridge.get_grasp_quat()
-
-    approach_h = bridge.get_approach_height()
-    grasp_d = bridge.get_grasp_depth()
-    safe_h = bridge.get_safe_height()
-    open_w = bridge.get_gripper_open_width()
-    close_w = bridge.get_gripper_close_width()
-    descent_vel = bridge.get_descent_velocity_scaling()
-    descent_accel = bridge.get_descent_accel_scaling()
-
-    steps = []
+    approach_h, grasp_d, safe_h = bridge.get_approach_height(), bridge.get_grasp_depth(), bridge.get_safe_height()
+    open_w, close_w = bridge.get_gripper_open_width(), bridge.get_gripper_close_width()
+    descent_vel, descent_accel = bridge.get_descent_velocity_scaling(), bridge.get_descent_accel_scaling()
     node = bridge.node
-    failed_step = None
-    at_grasp_pose = False  # track whether we descended to the object
-    actually_holding = False  # determined by gripper feedback after close
+    steps, failed_step, at_grasp_pose, actually_holding = [], None, False, False
 
-    # workspace check
     if not node.workspace_check(x, y):
         return {"success": False, "step": "workspace_check", "error": "Target outside workspace"}
 
@@ -356,189 +257,105 @@ def arm_execute_grasp(
         return time.monotonic() - t0
 
     def _gripper_is_closed():
-        """Check if the gripper is nearly fully closed (no object inside)."""
-        js = node.get_joint_state()
-        w = js.get("gripper_width")
-        if w is None:
-            return None  # can't determine
-        # If width < 0.03m (3cm), the gripper nearly fully closed → no object
-        return w < 0.03
+        w = node.get_joint_state().get("gripper_width")
+        return None if w is None else w < 0.03
 
     try:
-        # [1] Open gripper first, then move to approach pose
-        _log(f"GRASP 1/4: opening gripper + moving to approach pose (z={z + approach_h:.3f})")
-        steps.append("1/4 open_gripper + approach")
+        _log(f"GRASP 1/4: open gripper + approach (z={z + approach_h:.3f})")
         ok, msg = node.control_gripper(open_w, duration=2.0)
         if not ok:
-            failed_step = "1/4 open_gripper"
-            return {"success": False, "step": failed_step, "error": msg}
+            failed_step = "1/4 open_gripper"; return {"success": False, "step": failed_step, "error": msg}
         ok, msg = node.move_to_pose(x, y, z + approach_h, quat)
         if not ok:
-            failed_step = "1/4 approach"
-            return {"success": False, "step": failed_step, "error": msg}
+            failed_step = "1/4 approach"; return {"success": False, "step": failed_step, "error": msg}
 
-        # [2] SLOW Cartesian descent to grasp
         _log(f"GRASP 2/4: SLOW descent to grasp (z={z + grasp_d:.3f}, vel={descent_vel:.0%})")
-        steps.append("2/4 cartesian descent")
         ok, msg = node.move_cartesian(x, y, z + grasp_d, quat,
-                                       velocity_override=descent_vel,
-                                       accel_override=descent_accel)
+                                       velocity_override=descent_vel, accel_override=descent_accel)
         if not ok:
-            failed_step = "2/4 descent"
-            return {"success": False, "step": failed_step, "error": msg}
+            failed_step = "2/4 descent"; return {"success": False, "step": failed_step, "error": msg}
         at_grasp_pose = True
 
-        # [3] Close gripper
         _log("GRASP 3/4: closing gripper")
-        steps.append("3/4 close gripper")
         ok, msg = node.control_gripper(close_w, duration=2.0)
         if not ok:
-            failed_step = "3/4 close"
-            return {"success": False, "step": failed_step, "error": msg}
+            failed_step = "3/4 close"; return {"success": False, "step": failed_step, "error": msg}
 
-        # [3.5] Check actual gripper width to determine if holding
         is_closed = _gripper_is_closed()
+        actually_holding = (is_closed is False)
         if is_closed is True:
-            _log("GRASP: gripper nearly closed — NO object picked up")
-            actually_holding = False
+            _log("GRASP: gripper nearly closed — NO object")
         elif is_closed is False:
-            _log("GRASP: gripper stays open — object is held")
-            actually_holding = True
+            _log("GRASP: gripper stays open — object held")
         else:
-            # Can't determine — assume failure (conservative)
             _log("GRASP: cannot read gripper width, assuming not holding")
-            actually_holding = False
 
-        # [4] Lift to safe height (FAST)
         _log(f"GRASP 4/4: lifting to safe height (z={safe_h:.3f})")
-        steps.append("4/4 lift")
         ok, msg = node.move_cartesian(x, y, safe_h, quat)
         if not ok:
             ok, msg = node.move_to_pose(x, y, safe_h, quat)
         if not ok:
-            failed_step = "4/4 lift"
-            return {"success": False, "step": failed_step, "error": msg}
+            failed_step = "4/4 lift"; return {"success": False, "step": failed_step, "error": msg}
 
         _log(f"GRASP complete in {_elapsed():.1f}s, holding={actually_holding}")
-        if actually_holding:
-            instruction = "Object is held at safe height. Use arm_execute_place to put it down."
-        else:
-            instruction = ("Gripper fully closed — NO object inside. "
-                           "The gripper hardware measurement is authoritative: "
-                           "do NOT call arm_capture_image or arm_detect_vlm to verify. "
-                           "The camera cannot reliably detect whether the gripper is holding "
-                           "an object because the gripper is now at safe height out of view. "
-                           "Either retry the grasp (arm_execute_grasp) or report the miss to the user.")
+        instruction = (
+            "Object is held at safe height. Use arm_execute_place to put it down." if actually_holding
+            else "Gripper fully closed — NO object inside. TRUST this hardware measurement; "
+                 "do NOT call arm_capture_image/arm_detect_vlm to verify. "
+                 "Retry grasp or report miss to user.")
         return {
-            "success": True,
-            "steps": steps,
+            "success": True, "steps": steps, "holding": actually_holding,
             "state": "holding" if actually_holding else "empty",
-            "holding": actually_holding,
-            "gripper_closed": is_closed,
-            "pick_x": x,
-            "pick_y": y,
-            "instruction": instruction,
-            "elapsed_s": round(_elapsed(), 1),
+            "gripper_closed": is_closed, "pick_x": x, "pick_y": y,
+            "instruction": instruction, "elapsed_s": round(_elapsed(), 1),
         }
-
     finally:
-        # Track holding state based on actual gripper feedback
         if failed_step is None:
             bridge.set_holding(actually_holding)
-        # Recovery: if we failed at or after the descent (step 2+), we're near
-        # the object — try to lift to safety regardless of gripper state.
-        if failed_step is not None:
-            if at_grasp_pose:
-                # We're down near the object — must recover
-                recovered = _recover_to_safe(bridge, x, y, safe_h, quat)
-                if not recovered:
-                    # Recovery failed — emergency stop already triggered
-                    pass
-            elif failed_step.startswith("1/4"):
-                # Failed at approach — we're at home or wherever, gripper open.
-                # Already safe, no recovery needed.
-                pass
+        if failed_step and at_grasp_pose:
+            _recover_to_safe(bridge, x, y, safe_h, quat)
 
 
-def arm_execute_place(
-    bridge: "RobotBridge",
-    x: float, y: float, z: float,
-    quat: list[float] | None = None,
-) -> dict:
+def arm_execute_place(bridge: "RobotBridge", x: float, y: float, z: float,
+                      quat: list[float] | None = None) -> dict:
     """
-    Place the currently held object at (x, y, z) in base_link frame.
-
-    Steps:
-      1. Move to place pose above (safe height)
-      2. Cartesian descent to place Z
-      3. Open gripper
-
-    On failure, attempts recovery to safe height.
-    After success, the hand is empty at the place position.
-    Does NOT go home — caller can chain another grasp or call arm_go_home().
-
-    z is the surface height (e.g. desk top, z=0.0).
-    The flange descends to z + grasp_depth (same as grasp) to keep gripper tip
-    safely above the surface — internally adds the same 0.155m flange-offset
-    used during grasping, so the same z works for both pick and place.
+    Place the currently held object at (x, y, z). z = SURFACE height (e.g. desk top 0.0).
+    Flange descends to z + grasp_depth so gripper tip stays safely above surface.
+    Steps: 1) move to safe height  2) Cartesian descent  3) open gripper.
+    On failure, auto-recovers to safe height.
     """
     if quat is None:
         quat = bridge.get_grasp_quat()
-
     node = bridge.node
-    open_w = bridge.get_gripper_open_width()
-    safe_h = bridge.get_safe_height()
-    place_offset = bridge.get_grasp_depth()   # same 0.155m flange→tip offset as grasp
+    open_w, safe_h = bridge.get_gripper_open_width(), bridge.get_safe_height()
+    place_offset = bridge.get_grasp_depth()
+    steps, failed_step, at_descent = [], None, False
 
-    steps = []
-    failed_step = None
-    at_descent = False
-
-    # Safety: place Z must leave room for flange (gripper tip = flange_z - 0.175)
     if z < 0.0:
         return {"success": False, "step": "safety_check", "error": f"place z={z:.3f} below desk surface"}
-
-    target_z = z + place_offset   # flange target, gripper tip stays above surface
+    target_z = z + place_offset
 
     try:
-        # [1] Move to above place
-        _log(f"PLACE 1/3: moving to above (z={safe_h:.3f})")
-        steps.append("1/3 move above")
+        _log(f"PLACE 1/3: moving above (z={safe_h:.3f})")
         ok, msg = node.move_to_pose(x, y, safe_h, quat)
         if not ok:
-            failed_step = "1/3 move_above"
-            return {"success": False, "step": failed_step, "error": msg}
+            failed_step = "1/3 move_above"; return {"success": False, "step": failed_step, "error": msg}
 
-        # [2] Cartesian descent to place flange height
-        _log(f"PLACE 2/3: descending to place (flange z={target_z:.3f}, surface z={z:.3f})")
-        steps.append("2/3 descent")
+        _log(f"PLACE 2/3: descending (flange z={target_z:.3f}, surface z={z:.3f})")
         ok, msg = node.move_cartesian(x, y, target_z, quat)
         if not ok:
-            failed_step = "2/3 descent"
-            return {"success": False, "step": failed_step, "error": msg}
+            failed_step = "2/3 descent"; return {"success": False, "step": failed_step, "error": msg}
         at_descent = True
 
-        # [3] Open gripper
         _log("PLACE 3/3: opening gripper")
-        steps.append("3/3 open")
         ok, msg = node.control_gripper(open_w)
         if not ok:
-            failed_step = "3/3 open"
-            return {"success": False, "step": failed_step, "error": msg}
+            failed_step = "3/3 open"; return {"success": False, "step": failed_step, "error": msg}
 
         _log("PLACE complete")
-        return {
-            "success": True,
-            "steps": steps,
-            "state": "empty",
-            "place_x": x,
-            "place_y": y,
-        }
-
+        return {"success": True, "steps": steps, "state": "empty", "place_x": x, "place_y": y}
     finally:
-        # Track holding state
         if failed_step is None:
             bridge.set_holding(False)
-        if failed_step is not None and at_descent:
-            # We lowered to place position — lift to safe height
+        if failed_step and at_descent:
             _recover_to_safe(bridge, x, y, safe_h, quat)
