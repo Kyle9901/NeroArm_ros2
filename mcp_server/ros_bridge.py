@@ -16,6 +16,7 @@ Usage (from MCP server main thread):
 
 import math
 import os
+import subprocess
 import threading
 import time
 from typing import Optional
@@ -121,14 +122,14 @@ class RobotBridgeNode(Node):
         p("workspace_y_max", 0.2)
         p("approach_height", 0.26)
         p("safe_height", 0.40)
-        p("grasp_depth", 0.135)     # flange_to_tip - fingertip_overlap = 0.175 - 0.04
+        p("grasp_depth", 0.155)     # flange_to_tip - fingertip_overlap = 0.175 - 0.02
         p("place_x", -0.40)
         p("place_y", -0.25)
         p("place_z", 0.20)
         p("gripper_open_width", 0.10)
         p("gripper_close_width", 0.02)
         p("flange_to_tip", 0.175)          # 法兰 → 夹爪指尖距离, 固定硬件参数
-        p("fingertip_overlap", 0.04)       # 抓取时指尖探入物块表面的深度, 全局可调
+        p("fingertip_overlap", 0.02)       # 抓取时指尖探入物块表面的深度, 全局可调
         p("planning_time", 3.0)
         p("num_planning_attempts", 5)
         p("velocity_scaling", 0.15)           # normal motion (approach / lift / home)
@@ -464,7 +465,7 @@ class RobotBridgeNode(Node):
         rf = gh.get_result_async()
         if not self._spin_until(rf, timeout + 5):
             return False, ("MoveGroup result did not arrive in time "
-                                f"(timeout={timeout + max_plan:.0f}s). "
+                                f"(timeout={timeout + 5:.0f}s). "
                                 "The motion may still be executing — check the robot's position. "
                                 "If the robot is moving, wait for it to stop then call arm_get_status")
         code = rf.result().result.error_code.val
@@ -677,6 +678,8 @@ class RobotBridge:
         self._shutdown_flag = False
         self._holding = False    # whether gripper is currently holding an object
         self._holding_lock = threading.Lock()
+        self._managed_procs: dict[str, subprocess.Popen] = {}
+        self._proc_lock = threading.Lock()
 
     # ── lifecycle ──
     def start(self, wait_servers: bool = False) -> None:
@@ -768,3 +771,125 @@ class RobotBridge:
 
     def get_base_frame(self) -> str:
         return self.node._get_param("base_frame")
+
+    # ── bringup: launch management ──
+
+    def _spawn_launch(self, name: str, cmd: list[str]) -> tuple[bool, str]:
+        """Start a launch process in the background. Returns (ok, msg)."""
+        with self._proc_lock:
+            if name in self._managed_procs and self._managed_procs[name].poll() is None:
+                return False, f"{name} is already running (pid={self._managed_procs[name].pid})"
+            log_dir = "/tmp/robot_arm_bringup"
+            os.makedirs(log_dir, exist_ok=True)
+            log_path = os.path.join(log_dir, f"{name}.log")
+            with open(log_path, "w") as f:
+                proc = subprocess.Popen(
+                    cmd, stdout=f, stderr=subprocess.STDOUT,
+                    env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                )
+            self._managed_procs[name] = proc
+            return True, f"started (pid={proc.pid}, log={log_path})"
+
+    def _check_can(self, can_port: str = "can0") -> dict:
+        """Check CAN interface status. Returns dict with 'up' bool and 'message'."""
+        try:
+            out = subprocess.check_output(["ip", "link", "show", can_port],
+                                          stderr=subprocess.STDOUT, timeout=2.0).decode()
+            if "state UP" in out:
+                return {"up": True, "message": f"{can_port} is UP"}
+            else:
+                return {"up": False, "message": f"{can_port} exists but is DOWN. Run: sudo ip link set {can_port} up"}
+        except subprocess.CalledProcessError:
+            return {"up": False, "message": f"{can_port} not found. Check CAN hardware and driver"}
+        except Exception as e:
+            return {"up": False, "message": f"CAN check failed: {e}"}
+
+    def _wait_endpoint(self, etype: str, name: str, timeout: float) -> bool:
+        """Wait for a ROS endpoint (action/service/topic) to appear. Returns True if ready."""
+        t0 = time.monotonic()
+        node = self.node
+        while time.monotonic() - t0 < timeout:
+            try:
+                if etype == "action":
+                    from rclpy.action import ActionClient
+                    from moveit_msgs.action import MoveGroup as _MG
+                    ac = ActionClient(node, _MG, name)
+                    if ac.wait_for_server(timeout_sec=0.3):
+                        return True
+                elif etype == "topic":
+                    topic_names = [t[0] for t in node.get_topic_names_and_types()]
+                    if name in topic_names:
+                        return True
+            except Exception:
+                pass
+            time.sleep(0.5)
+        return False
+
+    def bringup_nodes(self, can_port: str = "can0", calib_name: str = "my_eih_calib_v6") -> dict:
+        """Start all 3 launch files (arm, camera, handeye TF). Returns status per component."""
+        can_status = self._check_can(can_port)
+        if not can_status["up"]:
+            return {
+                "success": False,
+                "can": can_status,
+                "hint": "CAN接口未就绪。请手动执行: sudo ip link set can0 type can bitrate 1000000 && sudo ip link set can0 up",
+                "arm": "skipped",
+                "camera": "skipped",
+                "calib": "skipped",
+            }
+
+        results = {"success": True, "can": can_status}
+
+        # 1. Arm + MoveIt
+        ok, msg = self._spawn_launch("arm", [
+            "ros2", "launch", "agx_arm_ctrl", "start_single_agx_arm_moveit.launch.py",
+            f"can_port:={can_port}", "arm_type:=nero", "effector_type:=agx_gripper",
+        ])
+        results["arm_launch"] = msg
+        if ok:
+            results["arm"] = "ready" if self._wait_endpoint("action", "/move_action", 10.0) else "started_but_not_ready"
+            if results["arm"] == "started_but_not_ready":
+                results["hint"] = ("MoveIt启动超时(10s)。可能是: (1) CAN未配置 — 执行 sudo ip link set can0 up "
+                                   "(2) 机械臂未上电 (3) 机械臂驱动未安装")
+        else:
+            results["arm"] = "failed"
+
+        # 2. Camera
+        ok, msg = self._spawn_launch("camera", [
+            "ros2", "launch", "orbbec_camera", "dabai.launch.py", "publish_tf:=false",
+        ])
+        results["camera_launch"] = msg
+        if ok:
+            results["camera"] = "ready" if self._wait_endpoint("topic", "/camera/color/image_raw", 3.0) else "started_but_not_ready"
+        else:
+            results["camera"] = "failed"
+
+        # 3. Handeye TF
+        ok, msg = self._spawn_launch("calib", [
+            "ros2", "launch", "easy_handeye2", "publish.launch.py", f"name:={calib_name}",
+        ])
+        results["calib_launch"] = msg
+        if ok:
+            results["calib"] = "ready" if self._wait_endpoint("topic", "/tf", 3.0) else "started_but_not_ready"
+        else:
+            results["calib"] = "failed"
+
+        return results
+
+    def bringup_status(self) -> dict:
+        """Return status of all managed processes, CAN, and key endpoints."""
+        result = {"can": self._check_can()}
+        procs = {}
+        with self._proc_lock:
+            for name, proc in self._managed_procs.items():
+                running = proc.poll() is None
+                procs[name] = {"pid": proc.pid, "running": running}
+        result["processes"] = procs
+
+        # Check endpoints
+        result["endpoints"] = {
+            "move_action": self._wait_endpoint("action", "/move_action", 0.5),
+            "camera_color": self._wait_endpoint("topic", "/camera/color/image_raw", 0.5),
+            "tf": self._wait_endpoint("topic", "/tf", 0.5),
+        }
+        return result

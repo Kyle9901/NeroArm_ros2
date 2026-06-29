@@ -31,6 +31,41 @@ from .tools import tools as _tools
 
 TOOL_DEFINITIONS = [
     {
+        "name": "arm_bringup_nodes",
+        "description": "Start the robot arm, camera, and handeye TF nodes. "
+                       "Checks CAN interface first — if CAN is down, the arm component will fail "
+                       "and the returned hint will tell the user to configure CAN manually. "
+                       "Waits for each component to become ready (MoveIt 10s, camera 3s, TF 3s). "
+                       "Returns status per component: 'ready', 'started_but_not_ready', or 'failed'. "
+                       "Call this once at the start of a session before any motion or vision tools.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "can_port": {
+                    "type": "string",
+                    "description": "CAN interface name. Default: can0.",
+                },
+                "calib_name": {
+                    "type": "string",
+                    "description": "Handeye calibration name. Default: my_eih_calib_v6.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "arm_bringup_status",
+        "description": "Check the current bringup status: CAN interface state, "
+                       "which managed processes are running, and whether key ROS endpoints "
+                       "(/move_action, /camera/color/image_raw, /tf) are available. "
+                       "Use this to diagnose why motion or vision tools are not working.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
         "name": "arm_configure_vlm",
         "description": "Configure VLM API settings at runtime. Use this to set or change the VLM API key, "
                        "API URL, and model name without restarting the MCP server. "
@@ -284,11 +319,11 @@ TOOL_DEFINITIONS = [
         "name": "arm_execute_grasp",
         "description": "Pick up an object at (x, y, z) in base_link frame. "
                        "⚠️ z = OBJECT SURFACE HEIGHT (from arm_get_3d_position), NOT flange height. "
-                       "The tool internally handles all z-offsets: flange descends to z + grasp_depth (0.135m), "
-                       "fingertip ends up at z - fingertip_overlap (z - 0.04m = 4cm BELOW surface to grip the object). "
+                       "The tool internally handles all z-offsets: flange descends to z + grasp_depth (0.155m), "
+                       "fingertip ends up at z - fingertip_overlap (z - 0.02m = 2cm BELOW surface to grip the object). "
                        "You do NOT need to add any offset to z — just pass the surface height directly. "
                        "Steps: 1) open gripper + move to approach pose (z + 0.26m), "
-                       "2) SLOW Cartesian descent to grasp (z + 0.135m → fingertip at z - 0.04m), "
+                       "2) SLOW Cartesian descent to grasp (z + 0.155m → fingertip at z - 0.02m), "
                        "3) close gripper + MEASURE actual gripper width, "
                        "4) lift to safe height (0.40m). "
                        "RETURNS: 'holding' field (bool) — TRUE if gripper stayed open (object inside), "
@@ -341,12 +376,35 @@ TOOL_DEFINITIONS = [
             "required": ["x", "y", "z"],
         },
     },
+    {
+        "name": "arm_visual_grasp",
+        "description": "Grasp an object using VLM detection + CSRT visual tracking. "
+                       "You only need to describe the target, e.g. 'blue block'. "
+                       "No pre-computed 3D coordinates required — the tool handles everything: "
+                       "go_home → VLM detect → CSRT tracker init → iterative look-and-move descent → grasp → lift. "
+                       "The tracker re-detects the object at each step to correct position errors. "
+                       "If the tracker loses the target, it falls back to VLM re-detection. "
+                       "Use this instead of arm_execute_grasp when depth accuracy is uncertain "
+                       "or when you want real-time position correction during the approach.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "description": "Natural language description of the object to grasp, e.g. 'blue block', 'red cube'.",
+                },
+            },
+            "required": ["target"],
+        },
+    },
 ]
 
 # ── Tool dispatch ──
 
 def _call_tool(name: str, args: dict, bridge: RobotBridge, vlm: VlmClient) -> dict:
     handlers = {
+        "arm_bringup_nodes":   lambda: _tools.arm_bringup_nodes(bridge, args.get("can_port", "can0"), args.get("calib_name", "my_eih_calib_v6")),
+        "arm_bringup_status":  lambda: _tools.arm_bringup_status(bridge),
         "arm_configure_vlm":   lambda: _tools.arm_configure_vlm(bridge, vlm, args.get("api_key"), args.get("api_url"), args.get("model")),
         "arm_capture_image":   lambda: _tools.arm_capture_image(bridge),
         "arm_detect_vlm":      lambda: _tools.arm_detect_vlm(bridge, vlm, args["target"]),
@@ -362,6 +420,7 @@ def _call_tool(name: str, args: dict, bridge: RobotBridge, vlm: VlmClient) -> di
         "arm_stop":            lambda: _tools.arm_stop(bridge),
         "arm_execute_grasp":   lambda: _tools.arm_execute_grasp(bridge, args["x"], args["y"], args["z"], args.get("quat")),
         "arm_execute_place":   lambda: _tools.arm_execute_place(bridge, args["x"], args["y"], args["z"], args.get("quat")),
+        "arm_visual_grasp":    lambda: _tools.arm_visual_grasp(bridge, vlm, args["target"]),
     }
     if name not in handlers:
         return {"success": False, "error": f"Unknown tool: {name}"}
