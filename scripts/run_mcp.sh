@@ -2,6 +2,7 @@
 # Wrapper for robot-arm MCP server
 # OpenClaw blocks PYTHONPATH in env, so set it here
 set -e
+exec 2>/tmp/robot_arm_mcp_stderr.log
 
 export PYTHONPATH="/home/alkaid/ros2_ws/src/vision_grasp:${PYTHONPATH}"
 export VLM_API_KEY="sk-ztI…nXH1"

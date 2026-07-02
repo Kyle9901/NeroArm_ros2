@@ -454,9 +454,9 @@ async def _async_main():
         return [Tool(**t) for t in TOOL_DEFINITIONS]
 
     @server.call_tool()
-    async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+    async def call_tool(name: str, arguments: dict[str, Any]) -> dict:
         result = _call_tool(name, arguments, _bridge, _vlm)
-        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+        return result
 
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())

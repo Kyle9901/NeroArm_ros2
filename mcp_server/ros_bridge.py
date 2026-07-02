@@ -423,7 +423,9 @@ class RobotBridgeNode(Node):
 
     # ── motion primitives ──
 
-    def move_joints(self, joint_angles_deg: list[float], timeout=20.0) -> tuple[bool, str]:
+    def move_joints(self, joint_angles_deg: list[float], timeout=20.0,
+                    velocity_override: float | None = None,
+                    accel_override: float | None = None) -> tuple[bool, str]:
         """Move to joint-space target.  joint_angles_deg: 7 floats in degrees."""
         if len(joint_angles_deg) != len(ARM_JOINT_NAMES):
             return False, f"expected {len(ARM_JOINT_NAMES)} joint angles, got {len(joint_angles_deg)}"
@@ -431,10 +433,10 @@ class RobotBridgeNode(Node):
         goal = _ma.MoveGroup.Goal()
         req = goal.request
         req.group_name = self._get_param("planning_group")
-        req.num_planning_attempts = 5
+        req.num_planning_attempts = self._get_param("num_planning_attempts")
         req.allowed_planning_time = self._get_param("planning_time")
-        req.max_velocity_scaling_factor = self._get_param("velocity_scaling")
-        req.max_acceleration_scaling_factor = self._get_param("accel_scaling")
+        req.max_velocity_scaling_factor = velocity_override if velocity_override is not None else self._get_param("velocity_scaling")
+        req.max_acceleration_scaling_factor = accel_override if accel_override is not None else self._get_param("accel_scaling")
         req.start_state = self._build_robot_state()
 
         c = Constraints()
@@ -474,7 +476,8 @@ class RobotBridgeNode(Node):
         return True, "ok"
 
     def move_to_pose(self, x: float, y: float, z: float, quat: list[float] | None = None,
-                     timeout=60.0) -> tuple[bool, str]:
+                     timeout=60.0, velocity_override: float | None = None,
+                     accel_override: float | None = None) -> tuple[bool, str]:
         """Move to Cartesian pose via MoveGroup.  quat defaults to grasp_quat.
         timeout covers the full planning + execution cycle."""
         if quat is None:
@@ -492,8 +495,8 @@ class RobotBridgeNode(Node):
         req.group_name = self._get_param("planning_group")
         req.num_planning_attempts = self._get_param("num_planning_attempts")
         req.allowed_planning_time = self._get_param("planning_time")
-        req.max_velocity_scaling_factor = self._get_param("velocity_scaling")
-        req.max_acceleration_scaling_factor = self._get_param("accel_scaling")
+        req.max_velocity_scaling_factor = velocity_override if velocity_override is not None else self._get_param("velocity_scaling")
+        req.max_acceleration_scaling_factor = accel_override if accel_override is not None else self._get_param("accel_scaling")
         req.start_state = self._build_robot_state()
         req.goal_constraints.append(self._make_pose_constraints(x, y, z, quat))
         goal.planning_options.plan_only = False
