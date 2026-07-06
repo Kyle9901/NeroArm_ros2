@@ -1,35 +1,38 @@
-# VLM 智能抓取系统
+# VLM 智能抓取系统 v1.1.2
 
-基于视觉大模型（VLM）的七轴机械臂智能抓取系统。支持自然语言描述目标物体，通过 eye-in-hand 深度相机实现 3D 视觉定位，联动 MoveIt 2 完成抓取-放置全自动化流程。
+基于 LLM 任务编排 + LangGraph 执行引擎的七轴机械臂智能抓取系统。通过 MCP 协议接入 OpenClaw,支持自然语言控制,内部自动完成检测、定位、抓取、放置全流程。
 
 ---
 
 ## 系统架构
 
 ```
-┌─────────────────────┐          ┌─────────────────────┐
-│   vlm_picker_node   │          │   grasp_executor    │
-│     (视觉感知)       │          │     (运动执行)       │
-│                     │          │                     │
-│  订阅:              │          │  订阅:              │
-│  /camera/color/     │          │  /grasp/target      │
-│         image_raw   │          │                     │
-│  /camera/depth/     │          │  动作客户端:         │
-│         image_raw   │          │  /move_action       │
-│  /camera/color/     │          │  /execute_trajectory│
-│         camera_info │          │  /compute_cartesian_path
-│                     │          │  gripper_controller/│
-│  VLM API 推理       │          │         follow_joint_trajectory
-│  TF2 坐标变换        │          │                     │
-│  OpenCV 颜色检测     │          │  抓取序列:           │
-│                     │          │  1.开夹爪+预抓位     │
-│  发布:              │          │  2.直线下降抓取      │
-│  /grasp/target      │─────────▶│  3.闭合夹爪         │
-│  (PoseStamped)      │          │  4.抬起至安全位      │
-│                     │          │  5.移动到放置位      │
-│                     │          │  6.放置+开夹爪       │
-│                     │          │  7.回初始位         │
-└─────────────────────┘          └─────────────────────┘
+OpenClaw (自然语言交互)
+    │  MCP 协议 (stdio)
+    ▼
+task_server.py (MCP 入口, 6 个工具)
+    │
+    ▼
+orchestrator/ (编排层)
+    ├── planner.py     → Planning LLM 生成 pipeline
+    ├── graph.py       → LangGraph 动态图执行
+    └── place_resolver.py → 方位词→坐标
+    │
+    ▼
+skills/ (技能层, 14 个确定性技能)
+    ├── perception.py  → locate_object / scan_scene
+    ├── manipulation.py → grasp_object / place_object
+    ├── prepare.py     → 启动节点
+    └── recovery.py    → 故障恢复
+    │
+    ▼
+components/ (原子组件层, 17 个)
+    ├── motion.py      → 8 运动组件
+    ├── perception.py  → 5 感知组件
+    └── infra.py       → 2 基建组件
+    │
+    ▼
+ros_bridge.py / vlm_client.py (硬件层)
 ```
 
 ---
@@ -38,29 +41,20 @@
 
 ### 系统与 ROS 2
 
-| 组件 | 版本 | 安装方式 |
-|------|------|----------|
-| Ubuntu | 24.04 LTS | |
-| ROS 2 | Jazzy Jalisco | [官方文档](https://docs.ros.org/en/jazzy/Installation.html) |
-| MoveIt 2 | 与 Jazzy 配套 | `sudo apt install ros-jazzy-moveit` |
+| 组件 | 版本 |
+|------|------|
+| Ubuntu | 24.04 LTS |
+| ROS 2 | Jazzy Jalisco |
+| MoveIt 2 | 与 Jazzy 配套 |
 
 ```bash
-sudo apt install ros-jazzy-cv-bridge ros-jazzy-tf2-ros-py \
-  ros-jazzy-tf2-geometry-msgs ros-jazzy-message-filters
-```
-
-### 第三方 ROS 2 包（需单独克隆到工作空间）
-
-```bash
-cd ~/ros2_ws/src
-git clone https://github.com/agxbot/agx_arm_ros.git        # 机械臂驱动
-git clone https://github.com/marcoesposito1988/easy_handeye2.git  # 手眼标定
+sudo apt install ros-jazzy-cv-bridge ros-jazzy-tf2-ros-py ros-jazzy-tf2-geometry-msgs
 ```
 
 ### Python 依赖
 
 ```bash
-pip install opencv-python numpy requests
+pip install opencv-python numpy requests langgraph langchain-core mcp
 ```
 
 ---
@@ -77,103 +71,111 @@ source install/setup.bash
 
 ## 使用
 
-### 1. 配置环境变量
+### 1. 配置
+
+复制启动脚本模板并填入 API key:
 
 ```bash
-export VLM_API_KEY="sk-xxxxxxxxxxxxxxxx"
-export VLM_API_URL="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
-export VLM_MODEL="qwen3.7-plus"
-
-# Debug 图片保存目录（可选，默认 ~/vlm_grasp_debug）
-export VLM_DEBUG_DIR="/tmp/vlm_grasp_debug"
+cp scripts/run_mcp.example.sh scripts/run_mcp.sh
+# 编辑 scripts/run_mcp.sh，填入你的 VLM_API_KEY 和 PLANNING_LLM_API_KEY
 ```
 
-### 2. 启动基础服务
+`scripts/run_mcp.sh` 已在 `.gitignore` 中，不会被提交到 git。
+
+VLM 和 Planning LLM 的模型/URL 默认值在 `mcp_server/vlm_client.py` 和 `mcp_server/orchestrator/planner_config.py` 中。
+
+### 2. 启动 MCP Server
 
 ```bash
-# 终端1: 机械臂 + MoveIt
-ros2 launch agx_arm_ros piper.launch.py
-
-# 终端2: 深度相机（确保 RGB-D 硬件对齐）
-ros2 launch realsense2_camera rs_launch.py align_depth.enable:=true
+scripts/run_mcp.sh
 ```
 
-### 3. 启动抓取节点
+### 3. OpenClaw 配置
 
-```bash
-# 终端3: VLM 视觉检测
-ros2 run vision_grasp vlm_picker
-
-# 终端4: 抓取执行
-ros2 run vision_grasp grasp_executor
+```json
+{
+  "mcpServers": {
+    "robot-arm": {
+      "command": "/home/alkaid/ros2_ws/src/vision_grasp/scripts/run_mcp.sh"
+    }
+  }
+}
 ```
 
 ---
 
-## 节点说明
+## MCP 工具
 
-| 节点 | 命令 | 功能 |
-|------|------|------|
-| `vlm_picker` | `ros2 run vision_grasp vlm_picker` | 接收相机图像，调用 VLM API，发布 `/grasp/target` |
-| `grasp_executor` | `ros2 run vision_grasp grasp_executor` | 订阅目标，执行 MoveIt 2 抓取-放置序列 |
-| `test_move_to` | `ros2 run vision_grasp test_move_to` | 单点运动测试工具 |
-
----
-
-## 话题接口
-
-| 话题名 | 类型 | 方向 | 说明 |
-|--------|------|------|------|
-| `/camera/color/image_raw` | `sensor_msgs/Image` | vlm_picker 订阅 | 彩色图 (BGR8) |
-| `/camera/depth/image_raw` | `sensor_msgs/Image` | vlm_picker 订阅 | 对齐深度图 (16UC1, mm) |
-| `/camera/color/camera_info` | `sensor_msgs/CameraInfo` | vlm_picker 订阅 | 相机内参 |
-| `/grasp/target` | `geometry_msgs/PoseStamped` | vlm_picker 发布 / grasp_executor 订阅 | 抓取目标（`frame_id=base_link`） |
-| `/feedback/joint_states` | `sensor_msgs/JointState` | grasp_executor 订阅 | 当前关节状态 |
+| 工具 | 说明 |
+|------|------|
+| `arm_execute_task` | 唯一任务入口,LLM 编排 + LangGraph 执行 |
+| `arm_prepare` | 启动/检查机械臂和相机节点 |
+| `arm_get_status` | 查询关节状态、夹爪、holding 等 |
+| `arm_stop` | 急停(同时清除上下文) |
+| `arm_configure_vlm` | 运行时配置 VLM |
+| `arm_reset_context` | 清除语义上下文 |
 
 ---
 
-## 参数配置
+## 技能列表
 
-### grasp_executor
+| 技能 | 说明 |
+|------|------|
+| `detect_by_color` | 纯 HSV 颜色检测(纯色物块) |
+| `locate_object` | 检测 + 3D 定位(HSV 优先,VLM 兜底) |
+| `grasp_object` | 开环抓取(自动 z-offset) |
+| `place_object` | 放置 |
+| `stack_on` | 叠加高度偏移(放到 X 上方) |
+| `scan_scene` | 扫描桌面所有色块 |
+| `resolve_place` | 方位词→坐标 |
+| `go_home` | 回 home 位置 |
+| `open_gripper` | 打开夹爪 |
+| `close_gripper` | 闭合夹爪 |
+| `prepare` | 启动节点 |
+| `wave` | 挥手 |
+| `nod` | 点头 |
+| `handshake` | 握手 |
 
-| ROS 参数 | 默认值 | 说明 |
-|----------|--------|------|
-| `planning_group` | `arm` | MoveIt 规划组名 |
-| `tcp_link` | `tcp_link` | TCP 连杆名 |
-| `base_frame` | `base_link` | 全局坐标系 |
-| `grasp_quat` | `[0.476, 0.523, -0.523, 0.476]` | **实测**抓取姿态四元数 (x,y,z,w) |
-| `approach_height` | `0.26` | 预抓位高度（法兰在物块上方 26cm） |
-| `grasp_depth` | `0.155` | 抓取位深度（法兰在物块上方 15.5cm） |
-| `safe_height` | `0.40` | 安全抬升高度 |
-| `place_x/y/z` | `-0.40, -0.25, 0.20` | 固定放置位 |
-| `velocity_scaling` | `0.05` | 速度缩放因子 |
-| `home_joints_deg` | `[0, -20, 0, 80, 0, 0, 80]` | 初始关节角度（度） |
+---
 
-> **重要**：`grasp_quat` 必须通过 `tf2_echo base_link tcp_link` 在**实际垂直向下抓取姿态**下实测获得，直接套用默认值可能导致 IK 无解或碰撞！
+## 状态管理
+
+系统维护**硬件状态**(实时查询)和**语义状态**(内存):
+
+- `holding`: 硬件真值,夹爪是否持有物体
+- `grasped_object`: 语义值,手持物体名称
+- `pick_x/y/z`: 上次抓取位置("放下"时用)
+- `recent_actions`: 最近动作历史(滚动窗口)
+
+语义状态**硬件真值优先**:`holding=false` 时自动清空 `grasped_object`。
 
 ---
 
 ## 安全机制
 
-`grasp_executor` 内置多层安全校验：
-
-1. **Workspace 限制**：目标必须在设定的工作空间范围内
-2. **高度保护**：`z < table_z_threshold` 的目标会被拒绝
-3. **放置点校验**：放置点也必须在 workspace 内
-4. **笛卡尔覆盖率检查**：直线运动覆盖率低于 50% 会终止
-5. **交互确认**：每次抓取前询问用户确认（可按 `n` 取消）
+1. **Workspace 限制**: 目标必须在工作空间内
+2. **Desk 碰撞**: 桌面自动添加为碰撞对象
+3. **故障恢复**: 抓取/放置失败自动 `recover_to_safe`
+4. **急停联动**: `arm_stop` 同时清除语义上下文
+5. **夹爪硬件反馈**: 抓取后通过硬件宽度判断是否持有
 
 ---
 
-## 调试
+## 参数配置
 
-VLM 节点的 debug 图片默认保存到 `~/vlm_grasp_debug/vlm_picker_debug.jpg`，可通过环境变量修改：
+### ros_bridge.py
 
-```bash
-export VLM_DEBUG_DIR=/tmp/vlm_grasp_debug
-```
-
-图片上会叠加检测框、深度采样 ROI、采样中心点、base_link 坐标值等信息。
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `home_joints_deg` | `[0, -20, 0, 80, 0, 0, 80]` | 初始关节角度 |
+| `grasp_quat` | `[0.503, 0.497, -0.499, 0.501]` | 抓取姿态四元数 |
+| `approach_height` | `0.26` | 预抓位高度 |
+| `grasp_depth` | `0.155` | 抓取时法兰偏移 |
+| `safe_height` | `0.40` | 安全抬升高度 |
+| `flange_to_tip` | `0.175` | 法兰→指尖距离 |
+| `fingertip_overlap` | `0.02` | 指尖探入深度 |
+| `velocity_scaling` | `0.15` | 普通运动速度 |
+| `descent_velocity_scaling` | `0.05` | 下降阶段速度 |
 
 ---
 

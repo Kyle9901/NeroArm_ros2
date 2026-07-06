@@ -29,3 +29,6 @@ log/
 tmp/
 .DS_Store
 *~
+
+# MCP 启动脚本 (含 API key, 不提交)
+scripts/run_mcp.sh

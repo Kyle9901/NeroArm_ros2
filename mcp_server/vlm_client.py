@@ -237,13 +237,6 @@ PROMPT_TEMPLATE = (
 )
 
 
-# ─────────────────────────── Public API ─────────────────────────────────────────────────────
-_DEFAULT_API_KEY = "sk-ws-H.RPMHLMD.eNJE.MEUCIBm07fqNtBjq6uFXj5r4XPa_kAGB8mEE0UKuLLZGbc2HAiEAkavdsqSmb1KgE9ZsQUArWKdVpYKSL5Q1QF_PmM_xzsY"
-_DEFAULT_API_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
-_DEFAULT_MODEL = "qwen3.6-plus"
-_DEFAULT_DEBUG_DIR = "/tmp/vlm_debug"
-
-
 def _draw_bboxes(img: np.ndarray, bboxes: list[list[int]], labels: list[str] | None = None) -> np.ndarray:
     """Draw bounding boxes on an image. bboxes: list of [xmin, ymin, xmax, ymax]."""
     out = img.copy()
@@ -269,11 +262,15 @@ class VlmClient:
         model_name: str | None = None,
         debug_dir: str | None = None,
     ):
-        self.api_key = api_key or os.environ.get("VLM_API_KEY") or _DEFAULT_API_KEY
-        self.api_url = api_url or os.environ.get("VLM_API_URL") or _DEFAULT_API_URL
-        self.model_name = model_name or os.environ.get("VLM_MODEL") or _DEFAULT_MODEL
-        self.debug_dir = debug_dir or os.environ.get("VLM_DEBUG_DIR") or _DEFAULT_DEBUG_DIR
+        self.api_key = api_key or os.environ.get("VLM_API_KEY")
+        self.api_url = api_url or os.environ.get("VLM_API_URL")
+        self.model_name = model_name or os.environ.get("VLM_MODEL")
+        self.debug_dir = debug_dir or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tmp")
         os.makedirs(self.debug_dir, exist_ok=True)
+        if not self.api_key:
+            raise RuntimeError(
+                "VLM_API_KEY not set. "
+                "Set the environment variable or pass api_key to VlmClient()")
 
     def _save_debug(self, image_bgr: np.ndarray, bboxes: list[list[int]],
                     labels: list[str] | None = None, prefix: str = "detect") -> str:
