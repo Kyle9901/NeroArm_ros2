@@ -10,13 +10,22 @@ if TYPE_CHECKING:
     from ..vlm_client import VlmClient
 
 
-def _target_color(target: str) -> str | None:
-    from ..vlm_client import _COLOR_HSV_RANGES
+_COLOR_NAME_MAP = {
+    "blue": "blue", "蓝色": "blue", "蓝": "blue",
+    "red": "red", "红色": "red", "红": "red",
+    "green": "green", "绿色": "green", "绿": "green",
+    "yellow": "yellow", "黄色": "yellow", "黄": "yellow",
+    "purple": "purple", "紫色": "purple", "紫": "purple",
+    "orange": "orange", "橙色": "orange", "橙": "orange",
+    "cyan": "cyan", "青色": "cyan", "青": "cyan",
+}
 
+
+def _target_color(target: str) -> str | None:
     target_lower = target.lower()
-    for color_name in _COLOR_HSV_RANGES:
-        if color_name in target_lower or target_lower in color_name:
-            return color_name
+    for cn_name, en_name in _COLOR_NAME_MAP.items():
+        if cn_name in target_lower:
+            return en_name
     return None
 
 
@@ -32,7 +41,7 @@ def _with_3d(bridge: "RobotBridge", frame, detection: dict) -> SkillResult:
 
 
 def locate_object(bridge: "RobotBridge", vlm: "VlmClient", target: str,
-                  location_hint: str = "") -> SkillResult:
+                  location_hint: str = "", use_vlm: bool = True) -> SkillResult:
     frame_result = perception.capture_image(bridge)
     if not frame_result.ok:
         return SkillResult.failure(frame_result.error or "capture failed", failed_step="capture", retryable=True)
@@ -43,6 +52,9 @@ def locate_object(bridge: "RobotBridge", vlm: "VlmClient", target: str,
         detected = perception.detect_by_color(frame, color_name, location_hint)
         if detected.ok and detected.data.get("found"):
             return _with_3d(bridge, frame, {"target": target, **detected.data})
+
+    if not use_vlm:
+        return SkillResult.failure(f"Object '{target}' not found (HSV only, no VLM)", failed_step="detect", retryable=True)
 
     detected = perception.detect_by_vlm(vlm, frame, target)
     if not detected.ok:

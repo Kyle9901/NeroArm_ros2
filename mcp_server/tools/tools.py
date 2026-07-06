@@ -376,15 +376,3 @@ def arm_execute_place(bridge: "RobotBridge", x: float, y: float, z: float,
             _recover_to_safe(bridge, x, y, safe_h, quat)
 
 
-# ══════════════════════════════════════════════════
-#  Visual servoing grasp
-# ══════════════════════════════════════════════════
-
-def arm_visual_grasp(bridge: "RobotBridge", vlm: "VlmClient", target: str) -> dict:
-    """
-    Grasp an object using VLM detection + CSRT tracking for iterative look-and-move.
-    Does NOT require pre-computed 3D coordinates — just describe the target.
-    Steps: go_home → VLM detect → CSRT track → iterative descent → grasp → lift.
-    """
-    from ..visual_servo import visual_grasp
-    return visual_grasp(bridge, vlm, target)

@@ -6,11 +6,63 @@ Stateless: takes image + target, returns detection result.
 import base64
 import json
 import os
+import re
 import time
 
 import cv2
 import numpy as np
 import requests
+
+
+def _safe_json_parse(text: str) -> dict:
+    """Robust JSON parse for VLM output — handles common LLM formatting issues."""
+    text = text.strip()
+    # Strip markdown code fences
+    if text.startswith("```"):
+        parts = text.split("```")
+        text = parts[1]
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.strip()
+    # Try direct parse first
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Fix single-quoted keys/values (common LLM mistake)
+    # Use ast.literal_eval for Python-style dicts
+    try:
+        import ast
+        return ast.literal_eval(text)
+    except (ValueError, SyntaxError):
+        pass
+    # Regex-based fix as fallback
+    try:
+        fixed = re.sub(r"'([^']*)':", r'"\1":', text)
+        fixed = re.sub(r":\s*'([^']*)'", r': "\1"', fixed)
+        fixed = re.sub(r":\s*True", r': true', fixed)
+        fixed = re.sub(r":\s*False", r': false', fixed)
+        fixed = re.sub(r":\s*None", r': null', fixed)
+        return json.loads(fixed)
+    except json.JSONDecodeError:
+        pass
+    # Extract JSON object with regex (supports nested braces)
+    m = re.search(r'\{.*\}', text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group())
+        except json.JSONDecodeError:
+            pass
+    # Last resort: try to fix malformed bbox like {"xmin": 425, 310, 510, 600}
+    # This is a common VLM mistake where it outputs positional values without keys
+    m = re.search(r'\{[^}]*\}', text)
+    if m:
+        candidate = m.group()
+        # Try to extract 4 numbers as bbox
+        nums = re.findall(r'\d+', candidate)
+        if len(nums) >= 4:
+            return {"found": True, "category": "other", "bbox": [int(n) for n in nums[:4]]}
+    raise RuntimeError(f"VLM returned unparseable JSON: {text[:300]}")
 
 # ─────────────────────────── Grid overlay (from vlm_picker_node) ───────────────────────────
 def _add_coordinate_grid(img: np.ndarray, step: int = 50) -> np.ndarray:
@@ -186,9 +238,9 @@ PROMPT_TEMPLATE = (
 
 
 # ─────────────────────────── Public API ─────────────────────────────────────────────────────
-_DEFAULT_API_KEY = "sk-HI22XB2pGNy2IKcxmfgvVHMB1hNzAdWgtYax2fkI2Oo6FaLn"
-_DEFAULT_API_URL = "http://8.153.64.170:6102/v1/chat/completions"
-_DEFAULT_MODEL = "qwen-vl-max"
+_DEFAULT_API_KEY = "sk-ws-H.RPMHLMD.eNJE.MEUCIBm07fqNtBjq6uFXj5r4XPa_kAGB8mEE0UKuLLZGbc2HAiEAkavdsqSmb1KgE9ZsQUArWKdVpYKSL5Q1QF_PmM_xzsY"
+_DEFAULT_API_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+_DEFAULT_MODEL = "qwen3.6-plus"
 _DEFAULT_DEBUG_DIR = "/tmp/vlm_debug"
 
 
@@ -272,12 +324,7 @@ class VlmClient:
                 f"Detail: {resp.text[:200]}")
         body = resp.json()
         text = body["choices"][0]["message"]["content"].strip()
-        if text.startswith("```"):
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.strip()
-        return json.loads(text)
+        return _safe_json_parse(text)
 
     # ── full detection pipeline ──
     def detect(self, image_bgr: np.ndarray, target: str) -> dict | None:
@@ -321,15 +368,27 @@ class VlmClient:
 
         if xmin is None:
             b = raw.get("bbox", {})
-            if not all(k in b for k in ("xmin", "ymin", "xmax", "ymax")):
+            if isinstance(b, dict):
+                # Try standard keys first
+                if all(k in b for k in ("xmin", "ymin", "xmax", "ymax")):
+                    xmin, ymin, xmax, ymax = int(b["xmin"]), int(b["ymin"]), int(b["xmax"]), int(b["ymax"])
+                # Fallback: VLM sometimes returns {"xmin": v1, v2, v3, v4} as a malformed dict
+                elif len(b) == 1 and isinstance(list(b.values())[0], (list, tuple)):
+                    vals = list(b.values())[0]
+                    if len(vals) == 4:
+                        xmin, ymin, xmax, ymax = [int(v) for v in vals]
+                # Fallback: try numeric values in order
+                elif len(b) >= 4:
+                    vals = list(b.values())[:4]
+                    if all(isinstance(v, (int, float)) for v in vals):
+                        xmin, ymin, xmax, ymax = [int(v) for v in vals]
+            elif isinstance(b, (list, tuple)) and len(b) == 4:
+                xmin, ymin, xmax, ymax = [int(v) for v in b]
+            if xmin is None:
                 raise RuntimeError(
                     f"VLM returned incomplete bbox: {b}. "
                     "The model did not follow the JSON output format. "
                     "Try simplifying the target description or retry")
-            xmin = int(b["xmin"])
-            ymin = int(b["ymin"])
-            xmax = int(b["xmax"])
-            ymax = int(b["ymax"])
 
         h, w = image_bgr.shape[:2]
         xmin, xmax = sorted((max(0, min(xmin, w - 1)), max(0, min(xmax, w - 1))))

@@ -20,7 +20,7 @@ class GraspGeometry:
     descent_accel: float
 
     @classmethod
-    def from_bridge(cls, bridge: "RobotBridge", hold_margin: float = 0.01) -> "GraspGeometry":
+    def from_bridge(cls, bridge: "RobotBridge", hold_margin: float = 0.005) -> "GraspGeometry":
         return cls(
             flange_to_tip=bridge.get_flange_to_tip(),
             grasp_depth=bridge.get_grasp_depth(),

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-MCP Server for AGX Robot Arm — new orchestration entry point.
-Only exposes 2 tools: arm_execute_task + arm_get_status.
-All task planning and skill sequencing is handled by the internal orchestrator.
+MCP Server for AGX Robot Arm — new agent/orchestration entry point.
 Usage: python -m mcp_server.task_server
+
+OpenClaw only sees the new high-level tools here. Legacy implementations remain
+in tools/tools.py as an internal backup, but are not exposed as MCP tools.
 """
 
 import asyncio
-import json
 import os
 import sys
 import traceback
@@ -20,93 +20,115 @@ if _pkg_dir not in sys.path:
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from mcp.types import Tool
 
 from .ros_bridge import RobotBridge
 from .vlm_client import VlmClient
-from .orchestrator.executor import TemplateExecutor
-from .orchestrator.router import route_template
+from .orchestrator.graph import GraphExecutor
+from .skills.prepare import prepare as prepare_skill
 from .tools import tools as _tools
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════
-#  Tool definitions
+#  Tool definitions — OpenClaw-visible API
 # ═══════════════════════════════════════════════════════════════════════════════════════════
 
 TOOL_DEFINITIONS = [
     {
         "name": "arm_execute_task",
         "description": (
-            "Execute a robot task using the internal orchestration engine. "
-            "This is the PRIMARY tool for all pick-and-place, visual grasping, and scene scanning tasks. "
-            "The orchestrator internally handles: routing → skill sequencing → parameter passing → "
-            "retry/recovery → z-offset calculation → grasp execution. "
-            "You do NOT need to call individual tools like arm_detect_vlm, arm_get_3d_position, "
-            "arm_execute_grasp, or arm_execute_place — this one tool does everything.\n\n"
-            "AVAILABLE TASKS:\n"
-            "- pick_and_place: grasp an object and place it somewhere. "
-            "Provide target (object description) and place (location word or coordinates).\n"
-            "- visual_grasp: grasp an object using visual servoing. "
-            "Use when depth is uncertain. Provide target.\n"
-            "- scan_scene: detect all visible color blocks on the table. No params needed.\n\n"
-            "PLACE LOCATIONS (方位词): right/右边, left/左边, center/中间, front/前面, back/后面\n\n"
-            "RETURNS: status (completed/failed/needs_input), messages, user_output with key results "
-            "(detection image, grasp coordinates, holding state, etc.).\n"
-            "If status=needs_input, the task is paused waiting for user choice — "
-            "call again with the same session_id and the user's answer."
+            "Execute a robot task using LLM-powered pipeline planning + LangGraph execution. "
+            "This is the ONLY tool needed for pick-and-place, visual grasping, and scene scanning. "
+            "The Planning LLM internally generates a skill sequence, then LangGraph deterministically executes it. "
+            "All z-offset handling, retry/recovery, and parameter passing is automatic.\n\n"
+            "Just describe the task naturally. Examples:\n"
+            "- '把蓝色方块放到右边'\n"
+            "- '直接抓黄色方块'\n"
+            "- '扫描桌面'\n"
+            "- 'pick the red block and place it on the left'\n\n"
+            "OPTIONAL: provide target (object description) and place (location word) to override LLM extraction.\n"
+            "Place words: right/右边, left/左边, center/中间, front/前面, back/后面."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "task": {
                     "type": "string",
-                    "description": (
-                        "Natural language task description. "
-                        "Examples: '把蓝色方块放到右边', '直接抓黄色方块', '扫描桌面', "
-                        "'pick the red block and place it on the left'"
-                    ),
+                    "description": "Natural language task, e.g. '把蓝色方块放到右边', '直接抓黄色方块', '扫描桌面'.",
                 },
                 "target": {
                     "type": "string",
-                    "description": (
-                        "Object to grasp. Describe in natural language, e.g. 'blue block', '红色方块'. "
-                        "Required for pick_and_place and visual_grasp tasks."
-                    ),
+                    "description": "Object to grasp, e.g. 'blue block', '红色方块'. Required for pick_and_place tasks.",
                 },
                 "place": {
                     "type": "string",
-                    "description": (
-                        "Where to place. Can be a location word (right/left/center/front/back or "
-                        "右边/左边/中间/前面/后面) or base_link coordinates like '{\"x\":-0.2,\"y\":-0.35,\"z\":0.0}'. "
-                        "Required for pick_and_place."
-                    ),
+                    "description": "Where to place. Use right/left/center/front/back or 右边/左边/中间/前面/后面.",
                 },
                 "session_id": {
                     "type": "string",
-                    "description": "Resume a paused task. Pass the session_id returned from a previous needs_input response.",
+                    "description": "Resume a paused task from a previous needs_input response.",
                 },
                 "answer": {
                     "type": "object",
-                    "description": "User's answer to a needs_input question. Pass the selected option, e.g. {\"selected_id\": 0}.",
+                    "description": "User's answer to a needs_input question.",
                 },
             },
-            "required": ["task"],
+            "required": [],
+        },
+    },
+    {
+        "name": "arm_prepare",
+        "description": (
+            "Prepare the robot system for task execution. Starts or checks arm, camera, and hand-eye TF nodes. "
+            "Call this once at the start of a session before arm_execute_task. "
+            "If everything is already ready, it returns immediately."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "can_port": {"type": "string", "description": "CAN interface name. Default: can0."},
+                "calib_name": {"type": "string", "description": "Hand-eye calibration name. Default: my_eih_calib_v6."},
+            },
+            "required": [],
         },
     },
     {
         "name": "arm_get_status",
         "description": (
-            "Get the current state of the robot arm: joint angles (degrees), gripper position, "
-            "holding state (whether gripper is currently holding an object), "
-            "workspace bounds (x/y min/max), safe height, desk surface Z, "
-            "and grasp geometry parameters. "
-            "Call this to check the arm's condition before or after a task."
+            "Get the current robot status: joint angles, gripper state, holding state, workspace bounds, "
+            "safe height, desk surface Z, and grasp geometry parameters."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "arm_stop",
+        "description": "Emergency stop — cancel current motion goals immediately.",
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "arm_configure_vlm",
+        "description": (
+            "Configure VLM API settings at runtime. Use this to set/change VLM API key, API URL, or model "
+            "without restarting the MCP server. Leave a field empty to keep its current value."
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "api_key": {"type": "string", "description": "VLM API key. Leave empty to keep current."},
+                "api_url": {"type": "string", "description": "VLM API endpoint URL. Leave empty to keep current."},
+                "model": {"type": "string", "description": "VLM model name. Leave empty to keep current."},
+            },
             "required": [],
         },
+    },
+    {
+        "name": "arm_reset_context",
+        "description": (
+            "Reset the robot's semantic context (grasped object, action history). "
+            "Call this when the user says 'reset', '重新开始', '清空状态', "
+            "or when the robot's physical state may differ from the software's memory."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
 ]
 
@@ -116,38 +138,61 @@ TOOL_DEFINITIONS = [
 # ═══════════════════════════════════════════════════════════════════════════════════════════
 
 def _call_tool(name: str, args: dict, bridge: RobotBridge, vlm: VlmClient,
-               executor: TemplateExecutor, sessions: dict) -> dict:
-    if name == "arm_get_status":
-        return _tools.arm_get_status(bridge)
+               executor: GraphExecutor, sessions: dict) -> dict:
+    try:
+        if name == "arm_execute_task":
+            return _execute_task(args, executor, sessions)
+        if name == "arm_prepare":
+            return _skill_result_to_dict(prepare_skill(
+                bridge,
+                can_port=args.get("can_port", "can0"),
+                calib_name=args.get("calib_name", "my_eih_calib_v6"),
+            ))
+        if name == "arm_get_status":
+            return _tools.arm_get_status(bridge)
+        if name == "arm_stop":
+            bridge.reset_task_context()
+            return _tools.arm_stop(bridge)
+        if name == "arm_reset_context":
+            bridge.reset_task_context()
+            return {"success": True, "message": "task context reset"}
+        if name == "arm_configure_vlm":
+            return _tools.arm_configure_vlm(
+                bridge,
+                vlm,
+                args.get("api_key"),
+                args.get("api_url"),
+                args.get("model"),
+            )
+        return {"success": False, "error": f"Unknown tool: {name}"}
+    except Exception as e:
+        return {"success": False, "error": f"{type(e).__name__}: {e}", "traceback": traceback.format_exc()}
 
-    if name == "arm_execute_task":
-        return _execute_task(args, executor, sessions)
 
-    return {"status": "failed", "error": f"Unknown tool: {name}"}
+def _skill_result_to_dict(result) -> dict:
+    return {
+        "success": result.ok,
+        "status": "completed" if result.ok else "failed",
+        "holding": result.holding,
+        "recovered": result.recovered,
+        "retryable": result.retryable,
+        "failed_step": result.failed_step,
+        "data": result.data,
+        "error": result.error,
+    }
 
 
-def _execute_task(args: dict, executor: TemplateExecutor,
+def _execute_task(args: dict, executor: GraphExecutor,
                   sessions: dict) -> dict:
     session_id = args.get("session_id")
     answer = args.get("answer")
 
-    # ── Resume from needs_input ──
     if session_id and session_id in sessions:
         return _resume_task(session_id, answer, sessions)
 
-    # ── New task ──
     task = args.get("task", "")
-    template = route_template(task)
-    if template is None:
-        return {
-            "status": "failed",
-            "error": "No matching template",
-            "messages": [
-                f"未匹配到任务模板: '{task}'",
-                "可用任务: pick_and_place (抓+放), visual_grasp (视觉伺服抓取), scan_scene (扫描桌面)",
-                "请重新描述任务,或使用旧版 arm_* 工具手动执行",
-            ],
-        }
+    if not task:
+        return {"status": "failed", "error": "Missing task", "messages": ["缺少 task 参数"]}
 
     params = {}
     if args.get("target"):
@@ -156,27 +201,16 @@ def _execute_task(args: dict, executor: TemplateExecutor,
         params["place"] = args["place"]
 
     try:
-        result = executor.execute_task(task, params=params, template=template)
+        result = executor.execute_task(task, params=params)
     except Exception as e:
         return {
             "status": "failed",
-            "template": template.name,
             "error": f"{type(e).__name__}: {e}",
             "traceback": traceback.format_exc(),
         }
 
-    if result.status == "needs_input":
-        sid = str(uuid.uuid4())[:8]
-        sessions[sid] = {
-            "template": template,
-            "params": params,
-            "outputs": result.outputs,
-        }
-        result.session_id = sid
-
     return {
         "status": result.status,
-        "template": result.template,
         "messages": result.messages,
         "user_output": result.user_output,
         "error": result.error,
@@ -202,24 +236,24 @@ def _resume_task(session_id: str, answer: dict | None,
 
 _bridge: RobotBridge | None = None
 _vlm: VlmClient | None = None
-_executor: TemplateExecutor | None = None
+_executor: GraphExecutor | None = None
 _sessions: dict[str, dict] = {}
 
 
 async def _async_main():
     global _bridge, _vlm, _executor, _sessions
-    print("[task-server] Starting MCP server (orchestration mode)...", file=sys.stderr)
+    print("[robot-arm] Starting MCP server (orchestration mode)...", file=sys.stderr)
     _vlm = VlmClient()
     if not _vlm.api_key:
-        print("[task-server] WARNING: VLM_API_KEY not set.", file=sys.stderr)
+        print("[robot-arm] WARNING: VLM_API_KEY not set.", file=sys.stderr)
     _bridge = RobotBridge()
-    print("[task-server] Connecting to ROS 2...", file=sys.stderr)
+    print("[robot-arm] Connecting to ROS 2...", file=sys.stderr)
     _bridge.start()
-    print("[task-server] ROS 2 bridge ready.", file=sys.stderr)
-    _executor = TemplateExecutor(_bridge, _vlm)
+    print("[robot-arm] ROS 2 bridge ready.", file=sys.stderr)
+    _executor = GraphExecutor(_bridge, _vlm)
     _sessions = {}
 
-    server = Server("robot-arm-task")
+    server = Server("robot-arm")
 
     @server.list_tools()
     async def list_tools() -> list[Tool]:
@@ -234,12 +268,10 @@ async def _async_main():
 
 
 def main():
-    print("[task-server] DISABLED — use server.py instead", file=sys.stderr)
-    return
     asyncio.run(_async_main())
     if _bridge:
         _bridge.shutdown()
-    print("[task-server] Server stopped.", file=sys.stderr)
+    print("[robot-arm] Server stopped.", file=sys.stderr)
 
 
 if __name__ == "__main__":

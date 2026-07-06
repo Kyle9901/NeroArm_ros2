@@ -681,6 +681,13 @@ class RobotBridge:
         self._shutdown_flag = False
         self._holding = False    # whether gripper is currently holding an object
         self._holding_lock = threading.Lock()
+        self._task_context: dict = {
+            "grasped_object": None,
+            "last_action": None,
+            "last_place": None,
+            "recent_actions": [],
+        }
+        self._context_lock = threading.Lock()
         self._managed_procs: dict[str, subprocess.Popen] = {}
         self._proc_lock = threading.Lock()
 
@@ -774,6 +781,62 @@ class RobotBridge:
 
     def get_base_frame(self) -> str:
         return self.node._get_param("base_frame")
+
+    # ── task context (semantic, in-memory) ──
+    def get_task_context(self) -> dict:
+        with self._context_lock:
+            return dict(self._task_context)
+
+    def update_task_context(self, **changes) -> None:
+        with self._context_lock:
+            self._task_context.update(changes)
+
+    def add_recent_action(self, action: str) -> None:
+        with self._context_lock:
+            actions = list(self._task_context.get("recent_actions", []))
+            actions.append(action)
+            self._task_context["recent_actions"] = actions[-5:]
+
+    def reset_task_context(self) -> None:
+        with self._context_lock:
+            self._task_context = {
+                "grasped_object": None,
+                "last_action": None,
+                "last_place": None,
+                "recent_actions": [],
+            }
+
+    def is_at_home(self, tolerance_rad: float = 0.08) -> bool:
+        state = self.node.get_joint_state().get("joints", {})
+        if not state:
+            return False
+        home_deg = list(self.node._get_param("home_joints_deg"))
+        for name, deg in zip(ARM_JOINT_NAMES, home_deg):
+            if name not in state:
+                return False
+            if abs(state[name] - math.radians(float(deg))) > tolerance_rad:
+                return False
+        return True
+
+    def build_planning_context(self) -> str:
+        holding = self.get_holding()
+        if not holding:
+            self.update_task_context(grasped_object=None)
+        ctx = self.get_task_context()
+        held = ctx.get("grasped_object") if holding else None
+        held_desc = held if held else ("unknown object" if holding else "none")
+        ready = self.bringup_status().get("endpoints", {})
+        lines = [
+            "## 当前机器人状态",
+            f"- holding: {holding}",
+            f"- grasped_object: {held_desc}",
+            f"- at_home: {self.is_at_home()}",
+            f"- nodes_ready: move_action={ready.get('move_action')}, camera={ready.get('camera_color')}, tf={ready.get('tf')}",
+        ]
+        recent = ctx.get("recent_actions") or []
+        if recent:
+            lines.append(f"- recent_actions: {recent}")
+        return "\n".join(lines)
 
     # ── bringup: launch management ──
 

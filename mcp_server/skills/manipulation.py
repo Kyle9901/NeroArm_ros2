@@ -1,5 +1,6 @@
 """Pick and place skills."""
 
+import time
 from typing import TYPE_CHECKING
 
 from .base import GraspGeometry, SkillResult
@@ -49,6 +50,7 @@ def grasp_object(bridge: "RobotBridge", x: float, y: float, z: float,
         recovered = recover_to_safe(bridge, x, y, geo, quat)
         return _fail(result.error or "close gripper failed", "close_gripper", recovered=recovered)
 
+    time.sleep(0.5)
     state = motion.read_joint_state(bridge)
     width = state.data.get("gripper_width") if state.ok else None
     holding = geo.is_holding(width)
