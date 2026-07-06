@@ -186,6 +186,7 @@ def _make_step_node(step: dict, bridge, vlm, max_retries: int = _MAX_RETRIES):
         for attempt in range(max_retries + 1):
             if attempt > 0:
                 print(f"[graph] retry {step_name} ({attempt}/{max_retries})", file=sys.stderr, flush=True)
+                motion.emergency_stop(bridge)
                 motion.go_home(bridge)
 
             args = _resolve_args(step.get("args", {}), state.get("step_outputs", {}))

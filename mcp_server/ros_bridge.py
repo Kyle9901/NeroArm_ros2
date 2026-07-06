@@ -918,7 +918,7 @@ class RobotBridge:
                 results["hint"] = ("MoveIt启动超时(10s)。可能是: (1) CAN未配置 — 执行 sudo ip link set can0 up "
                                    "(2) 机械臂未上电 (3) 机械臂驱动未安装")
         else:
-            results["arm"] = "failed"
+            results["arm"] = "already_ready" if self._wait_endpoint("action", "/move_action", 0.5) else "failed"
 
         # 2. Camera
         ok, msg = self._spawn_launch("camera", [
@@ -928,7 +928,7 @@ class RobotBridge:
         if ok:
             results["camera"] = "ready" if self._wait_endpoint("topic", "/camera/color/image_raw", 3.0) else "started_but_not_ready"
         else:
-            results["camera"] = "failed"
+            results["camera"] = "already_ready" if self._wait_endpoint("topic", "/camera/color/image_raw", 0.5) else "failed"
 
         # 3. Handeye TF
         ok, msg = self._spawn_launch("calib", [
@@ -938,7 +938,7 @@ class RobotBridge:
         if ok:
             results["calib"] = "ready" if self._wait_endpoint("topic", "/tf", 3.0) else "started_but_not_ready"
         else:
-            results["calib"] = "failed"
+            results["calib"] = "already_ready" if self._wait_endpoint("topic", "/tf", 0.5) else "failed"
 
         return results
 
