@@ -27,8 +27,14 @@ log/
 # 临时文件
 *.log
 tmp/
+/tmp/
 .DS_Store
 *~
+
+# 日志
+log/
+Log/
+/tmp/robot_arm_bringup/
 
 # MCP 启动脚本 (含 API key, 不提交)
 scripts/run_mcp.sh
