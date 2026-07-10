@@ -28,6 +28,7 @@ log/
 *.log
 tmp/
 /tmp/
+test_data/
 .DS_Store
 *~
 

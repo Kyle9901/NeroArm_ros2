@@ -43,7 +43,7 @@ def control_gripper(bridge: "RobotBridge", width: float, duration: float = 1.5,
     return ComponentResult.success(message=msg) if ok else ComponentResult.failure(msg)
 
 
-def go_home(bridge: "RobotBridge", timeout: float = 20.0) -> ComponentResult:
+def go_home(bridge: "RobotBridge", timeout: float = 60.0) -> ComponentResult:
     ok, msg = bridge.node.go_home(timeout)
     return ComponentResult.success(message=msg) if ok else ComponentResult.failure(msg)
 

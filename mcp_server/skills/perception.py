@@ -37,6 +37,7 @@ def _with_3d(bridge: "RobotBridge", frame, detection: dict) -> SkillResult:
     if not pos.ok:
         return SkillResult.failure(pos.error or "3D projection failed", failed_step="pixel_to_3d", retryable=True)
     data = {**detection, **pos.data}
+    print(f"[perception] 3D: x={pos.data['x']:.4f}, y={pos.data['y']:.4f}, z={pos.data['z']:.4f} (base_link)", flush=True)
     return SkillResult.success(**data)
 
 

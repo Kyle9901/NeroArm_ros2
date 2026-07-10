@@ -29,7 +29,7 @@ from geometry_msgs.msg import Pose, PoseStamped, PointStamped
 from moveit_msgs import action as _ma
 from moveit_msgs import srv as _ms
 from moveit_msgs.msg import Constraints, JointConstraint, MoveItErrorCodes, RobotState
-from moveit_msgs.msg import CollisionObject, PlanningScene
+from moveit_msgs.msg import CollisionObject, PlanningScene, AllowedCollisionEntry, AttachedCollisionObject
 from moveit_msgs.srv import ApplyPlanningScene as _ApplyPlanningScene
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -112,39 +112,49 @@ class RobotBridgeNode(Node):
     # ─────────────────────────── parameters ───────────────────────
     def _declare_params(self):
         p = self.declare_parameter
-        p("planning_group", "arm")
-        p("tcp_link", "tcp_link")
-        p("base_frame", "base_link")
-        p("grasp_quat", [0.503, 0.497, -0.499, 0.501])
-        p("workspace_x_min", -0.55)
-        p("workspace_x_max", 0.25)
-        p("workspace_y_min", -0.55)
-        p("workspace_y_max", 0.2)
-        p("approach_height", 0.26)
-        p("safe_height", 0.40)
-        p("grasp_depth", 0.155)     # flange_to_tip - fingertip_overlap = 0.175 - 0.02
-        p("place_x", -0.40)
-        p("place_y", -0.25)
-        p("place_z", 0.20)
-        p("gripper_open_width", 0.10)
-        p("gripper_close_width", 0.02)
-        p("flange_to_tip", 0.175)          # 法兰 → 夹爪指尖距离, 固定硬件参数
-        p("fingertip_overlap", 0.02)       # 抓取时指尖探入物块表面的深度, 全局可调
-        p("planning_time", 3.0)
-        p("num_planning_attempts", 5)
-        p("velocity_scaling", 0.15)           # normal motion (approach / lift / home)
-        p("accel_scaling", 0.15)
-        p("descent_velocity_scaling", 0.05)  # slow, precise Cartesian descent
-        p("descent_accel_scaling", 0.05)
-        p("cartesian_eef_step", 0.005)
-        p("cartesian_min_fraction", 0.5)
-        p("cartesian_jump_threshold", 2.0)
-        p("pos_tolerance", 0.01)
-        p("ori_tolerance", 0.1)
-        p("home_joints_deg", [0.0, -20.0, 0.0, 80.0, 0.0, 0.0, 80.0])
-        # Desk collision object
-        p("desk_z_surface", 0.0)               # desk surface in base_link frame
-        p("desk_size", [2.0, 2.0, 0.02])       # x, y, thickness
+        # ── 机械臂 / 规划 ──
+        p("planning_group", "arm")              # MoveIt 规划组名
+        p("tcp_link", "tcp_link")               # 末端执行器连杆名
+        p("base_frame", "base_link")            # 机器人基坐标系
+        p("grasp_quat", [0.503, 0.497, -0.499, 0.501])  # 实测抓取姿态四元数 (x,y,z,w)
+        # ── 工作空间 ──
+        p("workspace_x_min", -0.55)             # 工作空间 X 下限 (m)
+        p("workspace_x_max", 0.25)              # 工作空间 X 上限 (m)
+        p("workspace_y_min", -0.55)             # 工作空间 Y 下限 (m)
+        p("workspace_y_max", 0.2)               # 工作空间 Y 上限 (m)
+        # ── 抓取几何 ──
+        p("approach_height", 0.26)              # 预抓位高度: 物体表面上方距离 (m)
+        p("safe_height", 0.40)                  # 安全抬起高度 (m)
+        p("grasp_depth", 0.145)                 # 抓取深度: 从 approach 下降的距离 (m)
+        p("flange_to_tip", 0.175)               # 法兰 → 夹爪指尖距离, 固定硬件参数 (m)
+        p("fingertip_overlap", 0.02)            # 指尖探入物块表面的深度 (m)
+        # ── 放置位置 ──
+        p("place_x", -0.40)                     # 默认放置 X (m)
+        p("place_y", -0.25)                     # 默认放置 Y (m)
+        p("place_z", 0.20)                      # 默认放置 Z (m)
+        # ── 夹爪 ──
+        p("gripper_open_width", 0.10)           # 夹爪张开宽度 (m)
+        p("gripper_close_width", 0.02)          # 夹爪闭合宽度 (m)
+        # ── 规划 ──
+        p("planning_time", 10.0)                # 单次规划超时 (s), 首次规划需构建碰撞结构
+        p("num_planning_attempts", 3)           # 最大规划尝试次数
+        # ── 运动速度 (0-1, 1=全速) ──
+        p("velocity_scaling", 0.5)             # 普通运动速度倍率 (approach / lift / home)
+        p("accel_scaling", 0.3)                # 普通运动加速度倍率
+        p("descent_velocity_scaling", 0.2)     # 笛卡尔下降速度倍率 (慢速精确)
+        p("descent_accel_scaling", 0.05)        # 笛卡尔下降加速度倍率
+        # ── 笛卡尔路径 ──
+        p("cartesian_eef_step", 0.005)          # 笛卡尔路径步长 (m)
+        p("cartesian_min_fraction", 0.2)        # 笛卡尔路径最低通过率 (0-1)
+        p("cartesian_jump_threshold", 2.0)      # 笛卡尔路径跳跃阈值, 0=禁用
+        # ── 位姿容差 ──
+        p("pos_tolerance", 0.01)                # 位置容差 (m)
+        p("ori_tolerance", 0.1)                 # 姿态容差 (rad)
+        # ── Home 位置 ──
+        p("home_joints_deg", [0.0, -20.0, 0.0, 80.0, 0.0, 0.0, 80.0])  # 7 关节 home 角度 (度)
+        # ── 桌面碰撞对象 ──
+        p("desk_z_surface", -0.013)             # 桌面在 base_link 中的 Z 坐标 (m)
+        p("desk_size", [2.0, 2.0, 0.02])        # 桌面碰撞体: 长, 宽, 厚度 (m)
 
     def _init_moveit_clients(self):
         from control_msgs.action import FollowJointTrajectory as FJT
@@ -158,6 +168,8 @@ class RobotBridgeNode(Node):
                                                   callback_group=self.cb_group)
         self._planning_scene_cli = self.create_client(
             _ApplyPlanningScene, "/apply_planning_scene", callback_group=self.cb_group)
+        self._planning_scene_pub = self.create_publisher(
+            PlanningScene, "/planning_scene", 10)
         self._desk_added = False
 
     # ─────────────────────────── subscribers ──────────────────────
@@ -252,6 +264,130 @@ class RobotBridgeNode(Node):
         self._desk_added = True
         self.get_logger().info("desk collision object added")
         return True
+
+    # ─────────────────────────── target collision object ──────────────
+    def add_target_collision(self, x: float, y: float, z: float,
+                             object_id: str = "target_object",
+                             size: tuple[float, float, float] = (0.06, 0.06, 0.08),
+                             shape: str = "BOX",
+                             timeout: float = 5.0) -> bool:
+        """Add target object as collision object and allow gripper to touch it.
+
+        Args:
+            x, y, z: Object center in base_link frame.
+            object_id: Unique name for this collision object.
+            size: (x, y, z) dimensions in meters. Default 6x6x8cm for blocks/cups.
+            shape: 'BOX' or 'CYLINDER'.
+        """
+        if not self._planning_scene_cli.wait_for_service(timeout):
+            self.get_logger().warn("apply_planning_scene not available")
+            return False
+
+        co = CollisionObject()
+        co.id = object_id
+        co.header.frame_id = self._get_param("base_frame")
+        co.operation = CollisionObject.ADD
+
+        if shape.upper() == "CYLINDER":
+            prim = SolidPrimitive()
+            prim.type = SolidPrimitive.CYLINDER
+            prim.dimensions = [size[2], size[0] / 2.0]  # height, radius
+        else:
+            prim = SolidPrimitive()
+            prim.type = SolidPrimitive.BOX
+            prim.dimensions = list(size)
+
+        co.primitives.append(prim)
+        obj_pose = Pose()
+        obj_pose.position.x = float(x)
+        obj_pose.position.y = float(y)
+        obj_pose.position.z = float(z)
+        obj_pose.orientation.w = 1.0
+        co.primitive_poses.append(obj_pose)
+
+        scene = PlanningScene()
+        scene.is_diff = True
+        scene.world.collision_objects.append(co)
+
+        req = _ApplyPlanningScene.Request()
+        req.scene = scene
+
+        self.get_logger().info(
+            f"Adding target collision: id={object_id}, pos=({x:.3f},{y:.3f},{z:.3f}), "
+            f"shape={shape}, size={size}")
+
+        future = self._planning_scene_cli.call_async(req)
+        if not self._spin_until(future, timeout):
+            self.get_logger().warn("add target collision timeout")
+            return False
+        resp = future.result()
+        if resp is None or not resp.success:
+            self.get_logger().warn("add target collision failed")
+            return False
+
+        # 发布全局 ACM: 9×9 全 True 方阵
+        # MoveIt2 Jazzy 的 is_diff 会清空不在名单里的连杆免检规则
+        # 必须把所有需要免检的连杆全部列入
+        acm_names = [
+            object_id,
+            "gripper_base", "gripper_link1", "gripper_link2", "tcp_link",
+            "gripper_flange", "link7", "link5", "link6",
+        ]
+        acm_scene = PlanningScene()
+        acm_scene.is_diff = True
+        acm_scene.allowed_collision_matrix.entry_names = acm_names
+        for _ in acm_names:
+            entry = AllowedCollisionEntry()
+            entry.enabled = [True] * len(acm_names)
+            acm_scene.allowed_collision_matrix.entry_values.append(entry)
+        self._planning_scene_pub.publish(acm_scene)
+        self.get_logger().info(f"target collision '{object_id}' added, ACM ghost mode enabled")
+        return True
+
+    def remove_target_collision(self, object_id: str = "target_object",
+                                timeout: float = 5.0) -> bool:
+        """Remove target collision object and clear its ACM entry."""
+        if not self._planning_scene_cli.wait_for_service(timeout):
+            return False
+
+        scene = PlanningScene()
+        scene.is_diff = True
+
+        # 1. 移除碰撞对象
+        co = CollisionObject()
+        co.id = object_id
+        co.operation = CollisionObject.REMOVE
+        scene.world.collision_objects.append(co)
+
+        # 2. 恢复 ACM: target_object 恢复碰撞检测，连杆自碰撞保持免检
+        acm_names = [
+            object_id,
+            "gripper_base", "gripper_link1", "gripper_link2", "tcp_link",
+            "gripper_flange", "link7", "link5", "link6",
+        ]
+        acm_scene = PlanningScene()
+        acm_scene.is_diff = True
+        acm_scene.allowed_collision_matrix.entry_names = acm_names
+        for i, name_i in enumerate(acm_names):
+            entry = AllowedCollisionEntry()
+            row = []
+            for j, name_j in enumerate(acm_names):
+                if name_i == object_id or name_j == object_id:
+                    row.append(False)   # 目标物体恢复碰撞
+                else:
+                    row.append(True)    # 连杆保持免检
+            entry.enabled = row
+            acm_scene.allowed_collision_matrix.entry_values.append(entry)
+        self._planning_scene_pub.publish(acm_scene)
+
+        req = _ApplyPlanningScene.Request()
+        req.scene = scene
+
+        future = self._planning_scene_cli.call_async(req)
+        if not self._spin_until(future, timeout):
+            return False
+        resp = future.result()
+        return resp is not None and resp.success
 
     # ─────────────────────────── vision helpers (thread-safe via _lock) ──
     def get_latest_images(self, timeout=2.0) -> tuple[np.ndarray, np.ndarray] | None:
@@ -465,9 +601,10 @@ class RobotBridgeNode(Node):
                                 "(2) robot is already at the target, "
                                 "(3) start state is invalid. Try arm_go_home and retry")
         rf = gh.get_result_async()
-        if not self._spin_until(rf, timeout + 5):
+        max_plan = self._get_param("num_planning_attempts") * self._get_param("planning_time")
+        if not self._spin_until(rf, timeout + max_plan):
             return False, ("MoveGroup result did not arrive in time "
-                                f"(timeout={timeout + 5:.0f}s). "
+                                f"(timeout={timeout + max_plan:.0f}s). "
                                 "The motion may still be executing — check the robot's position. "
                                 "If the robot is moving, wait for it to stop then call arm_get_status")
         code = rf.result().result.error_code.val
@@ -632,8 +769,8 @@ class RobotBridgeNode(Node):
                            "Check gripper controller status and mechanical limits")
         return True, "ok"
 
-    def go_home(self, timeout=20.0) -> tuple[bool, str]:
-        """Move to home joint configuration."""
+    def go_home(self, timeout=60.0) -> tuple[bool, str]:
+        """Move to home joint configuration. 60s timeout for first plan with Octomap."""
         home_deg = list(self._get_param("home_joints_deg"))
         return self.move_joints(home_deg, timeout)
 
@@ -649,21 +786,14 @@ class RobotBridgeNode(Node):
             send_future.add_done_callback(_on_done)
 
     def emergency_stop(self) -> tuple[bool, str]:
-        """Cancel all active MoveIt / gripper / execute goals immediately."""
-        cancelled = 0
+        """Clear active goal tracking. Does NOT cancel goals — avoids MoveIt Jazzy crash bug."""
         with self._gh_lock:
-            for gh in self._active_goal_handles:
-                try:
-                    gh.cancel_goal_async()
-                    cancelled += 1
-                except Exception:
-                    pass
+            count = len(self._active_goal_handles)
             self._active_goal_handles.clear()
-
-        if cancelled > 0:
-            self.get_logger().warn(f"EMERGENCY STOP: cancelled {cancelled} active goal(s)")
-            return True, f"cancelled {cancelled} active goal(s)"
-        return True, "no active goals to cancel"
+        if count > 0:
+            self.get_logger().warn(f"EMERGENCY STOP: cleared {count} tracked goal(s)")
+            return True, f"cleared {count} tracked goal(s)"
+        return True, "no active goals"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════
