@@ -17,8 +17,8 @@ export PLANNING_LLM_API_URL="https://dashscope.aliyuncs.com/compatible-mode/v1/c
 export PLANNING_LLM_MODEL="deepseek-v4-flash"
 
 # YOLO detection
-export YOLO_MODEL_PATH="/home/alkaid/ros2_ws/src/vision_grasp/models/yolov11s.pt"
-export YOLO_CONFIDENCE="0.5"
+export YOLO_MODEL_PATH="/home/alkaid/ros2_ws/src/vision_grasp/models/yolov8s.pt"
+export YOLO_CONFIDENCE="0.35"
 export YOLO_DEVICE="cuda"
 export VLM_FALLBACK="1"
 

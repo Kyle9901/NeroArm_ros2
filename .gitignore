@@ -24,18 +24,18 @@ log/
 .idea/
 *.code-workspace
 
-# 临时文件
+# 运行时输出和临时文件
 *.log
-tmp/
-/tmp/
+tmp/**
+!tmp/.gitkeep
 test_data/
+test_output/
 .DS_Store
 *~
 
 # 日志
 log/
 Log/
-/tmp/robot_arm_bringup/
 
 # MCP 启动脚本 (含 API key, 不提交)
 scripts/run_mcp.sh

@@ -1,1 +1,0 @@
-"""Legacy MCP tools — kept as internal backup, not exposed to OpenClaw."""

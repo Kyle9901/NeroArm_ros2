@@ -200,14 +200,16 @@ class YoloDetector:
     def __init__(
         self,
         model_path: str | None = None,
-        confidence: float = 0.5,
+        confidence: float | None = None,
         device: str | None = None,
     ):
         self._model_path = model_path or os.environ.get(
             "YOLO_MODEL_PATH",
-            os.path.join(_pkg_dir, "models", "yolov11s.pt"),
+            os.path.join(_pkg_dir, "models", "yolov8s.pt"),
         )
-        self.confidence = confidence
+        self.confidence = confidence if confidence is not None else float(
+            os.environ.get("YOLO_CONFIDENCE", "0.35")
+        )
         self._device = device or os.environ.get("YOLO_DEVICE", "cuda")
 
         self._load_model()
@@ -271,6 +273,12 @@ class YoloDetector:
                   file=sys.stderr, flush=True)
 
         self._class_names = self.model.names  # {0: 'person', 1: 'bicycle', ...}
+
+        # Warmup: run a dummy inference to compile CUDA kernels
+        import numpy as np
+        dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+        _ = self.model(dummy, conf=self.confidence, verbose=False)
+        print(f"[yolo] Warmup complete, ready for inference", file=sys.stderr, flush=True)
 
     # ─────────────────────────── internal helpers ───────────────────────────
 
@@ -375,6 +383,7 @@ class YoloDetector:
             return {"found": False}
 
         best["source"] = "YOLO"
+        best["found"] = True
         return best
 
     def detect_all(self, image_bgr: np.ndarray) -> list[dict]:

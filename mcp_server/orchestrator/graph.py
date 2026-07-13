@@ -14,9 +14,8 @@ from langgraph.graph import StateGraph, START, END
 from .planner import plan_pipeline, SKILL_SCHEMA
 from .planner_config import PLANNING_LLM_CONFIG
 from ..components import motion
-from ..skills import manipulation, perception, prepare as prepare_skill
-from ..skills.base import SkillResult, GraspGeometry
-from .place_resolver import resolve_place as _resolve_place
+from ..skills import basic, gestures, manipulation, perception, placement, prepare
+from ..skills.base import SkillResult
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════
 #  Skill registry — functions callable by graph nodes
@@ -25,101 +24,26 @@ from .place_resolver import resolve_place as _resolve_place
 _MAX_RETRIES = 3
 
 
-def _skill_go_home(bridge, **kwargs) -> SkillResult:
-    if bridge.is_at_home():
-        return SkillResult.success(already_home=True)
-    result = motion.go_home(bridge)
-    if result.ok:
-        return SkillResult.success(already_home=False)
-    return SkillResult.failure(result.error or "go_home failed", failed_step="go_home", retryable=True)
-
-
-def _skill_resolve_place(bridge, place: str, **kwargs) -> SkillResult:
-    try:
-        coords = _resolve_place(bridge, place)
-        return SkillResult.success(**coords)
-    except Exception as e:
-        return SkillResult.failure(str(e), failed_step="resolve_place", retryable=False)
-
-
-def _skill_stack_on(bridge, x: float, y: float, z: float, height: float = 0.05, **kwargs) -> SkillResult:
-    return SkillResult.success(x=x, y=y, z=z + height)
-
-
-def _skill_open_gripper(bridge, **kwargs) -> SkillResult:
-    result = motion.control_gripper(bridge, 0.10, duration=1.5)
-    if result.ok:
-        return SkillResult.success()
-    return SkillResult.failure(result.error or "open gripper failed", failed_step="open_gripper", retryable=True)
-
-
-def _skill_close_gripper(bridge, **kwargs) -> SkillResult:
-    result = motion.control_gripper(bridge, 0.02, duration=1.5)
-    if result.ok:
-        return SkillResult.success()
-    return SkillResult.failure(result.error or "close gripper failed", failed_step="close_gripper", retryable=True)
-
-
-def _skill_wave(bridge, times: int = 5, **kwargs) -> SkillResult:
-    right = [0, -20, 0, 40, 0, 20, 10]
-    left = [0, -20, 0, 40, 0, -20, 10]
-    for i in range(times):
-        target = right if i % 2 == 0 else left
-        result = motion.move_joints(bridge, target, timeout=10.0, velocity=0.3, accel=0.5)
-        if not result.ok:
-            return SkillResult.failure(result.error or "wave failed", failed_step="wave", retryable=False)
-    return SkillResult.success(waves=times)
-
-
-def _skill_nod(bridge, times: int = 4, **kwargs) -> SkillResult:
-    up = [0, -20, 0, 80, 0, 0, 90]
-    down = [0, -20, 0, 80, 0, 0, 70]
-    for i in range(times):
-        target = up if i % 2 == 0 else down
-        result = motion.move_joints(bridge, target, timeout=10.0, velocity=0.4, accel=0.4)
-        if not result.ok:
-            return SkillResult.failure(result.error or "nod failed", failed_step="nod", retryable=False)
-    return SkillResult.success(nods=times)
-
-
-def _skill_handshake(bridge, times: int = 4, **kwargs) -> SkillResult:
-    start = [0, 40, 0, 70, 0, 0, 25]
-    down = [0, 40, 0, 65, 0, 0, 25]
-    up = [0, 40, 0, 75, 0, 0, 25]
-    result = motion.move_joints(bridge, start, timeout=10.0, velocity=0.4, accel=0.4)
-    if not result.ok:
-        return SkillResult.failure(result.error or "handshake failed", failed_step="handshake", retryable=False)
-    for i in range(times):
-        target = down if i % 2 == 0 else up
-        result = motion.move_joints(bridge, target, timeout=10.0, velocity=0.4, accel=0.4)
-        if not result.ok:
-            return SkillResult.failure(result.error or "handshake failed", failed_step="handshake", retryable=False)
-    return SkillResult.success(shakes=times)
-
-
-def _skill_detect_by_color(bridge, vlm, target: str, **kwargs) -> SkillResult:
-    return perception.locate_object(bridge, vlm, target, use_vlm=False)
-
-
 # All skills the LLM can reference
 _SKILL_FNS = {
-    "go_home": _skill_go_home,
+    "go_home": basic.go_home,
     "locate_object": perception.locate_object,
-    "detect_by_color": _skill_detect_by_color,
+    "detect_by_color": perception.detect_by_color,
     "scan_scene": perception.scan_scene,
     "grasp_object": manipulation.grasp_object,
     "place_object": manipulation.place_object,
-    "resolve_place": _skill_resolve_place,
-    "stack_on": _skill_stack_on,
-    "prepare": prepare_skill.prepare,
-    "open_gripper": _skill_open_gripper,
-    "close_gripper": _skill_close_gripper,
-    "wave": _skill_wave,
-    "nod": _skill_nod,
-    "handshake": _skill_handshake,
+    "resolve_place": placement.resolve_place,
+    "stack_on": placement.stack_on,
+    "prepare": prepare.prepare,
+    "open_gripper": basic.open_gripper,
+    "close_gripper": basic.close_gripper,
+    "wave": gestures.wave,
+    "nod": gestures.nod,
+    "handshake": gestures.handshake,
 }
 
-_VLM_SKILLS = {"locate_object", "detect_by_color"}
+_VLM_SKILLS = {"detect_by_color"}
+_YOLO_SKILLS = {"locate_object", "scan_scene"}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════
@@ -173,10 +97,11 @@ def _resolve_args(args: dict, step_outputs: dict) -> dict:
     return resolved
 
 
-def _make_step_node(step: dict, bridge, vlm, max_retries: int = _MAX_RETRIES):
+def _make_step_node(step: dict, bridge, vlm, yolo, max_retries: int = _MAX_RETRIES):
     skill_name = step["skill"]
     skill_fn = _SKILL_FNS[skill_name]
     needs_vlm = skill_name in _VLM_SKILLS
+    needs_yolo = skill_name in _YOLO_SKILLS
     step_name = step["name"]
     is_grasp = skill_name == "grasp_object"
 
@@ -190,7 +115,12 @@ def _make_step_node(step: dict, bridge, vlm, max_retries: int = _MAX_RETRIES):
                 motion.go_home(bridge)
 
             args = _resolve_args(step.get("args", {}), state.get("step_outputs", {}))
-            if needs_vlm:
+            if needs_yolo:
+                # Perception skills do not share the same positional signature:
+                # locate_object(..., target, yolo=None) would otherwise receive
+                # yolo as ``target`` and then receive ``target`` again via args.
+                result = skill_fn(bridge, vlm, yolo=yolo, **args)
+            elif needs_vlm:
                 result = skill_fn(bridge, vlm, **args)
             else:
                 result = skill_fn(bridge, **args)
@@ -354,7 +284,7 @@ def _make_cleanup_node(bridge):
     return node
 
 
-def build_graph(pipeline: list[dict], bridge, vlm,
+def build_graph(pipeline: list[dict], bridge, vlm, yolo,
                 user_visible: list[str] | None = None,
                 max_retries: int = _MAX_RETRIES):
     graph = StateGraph(TaskState)
@@ -362,7 +292,7 @@ def build_graph(pipeline: list[dict], bridge, vlm,
 
     for i, step in enumerate(pipeline):
         retries = 1 if step.get("skill") == "grasp_object" else max_retries
-        graph.add_node(f"step_{i}", _make_step_node(step, bridge, vlm, retries))
+        graph.add_node(f"step_{i}", _make_step_node(step, bridge, vlm, yolo, retries))
 
     graph.add_node("done", _make_done_node(user_visible))
     graph.add_node("cleanup_home", _make_cleanup_node(bridge))
@@ -394,13 +324,87 @@ def build_graph(pipeline: list[dict], bridge, vlm,
 #  Fast rule matching — skips LLM for simple, deterministic tasks
 # ═══════════════════════════════════════════════════════════════════════════════════════════
 
+import re as _re
+
+# Pre-defined place keywords → resolve_place arg
+_PLACE_KEYWORDS = {
+    "右边": "右边", "右边": "右边", "right": "右边",
+    "左边": "左边", "左边": "左边", "left": "左边",
+    "中间": "中间", "中间": "中间", "center": "中间",
+    "前面": "前面", "前面": "前面", "front": "前面",
+    "后面": "后面", "后面": "后面", "back": "后面",
+    "原位": "原位", "原位置": "原位", "原处": "原位",
+}
+
+
+def _parse_pick_place(text: str) -> tuple[str | None, str | None]:
+    """Extract (target_object, place_location) from pick-and-place task text.
+
+    Returns (target, place) where target is the object description and place
+    is the destination keyword. Both can be None if not found.
+    """
+    target = None
+    place = None
+
+    # Pattern: "抓取X并放到Y" / "抓取X放到Y" / "把X放到Y"
+    m = _re.search(r"(?:抓取|拿起|pick\s*(?:up)?)\s*(.+?)\s*(?:并|然后|再)?\s*(?:放到|放回|放到|放置到|移动到|place\s*(?:to|at)?)\s*(.+)", text)
+    if m:
+        target = m.group(1).strip()
+        place_raw = m.group(2).strip()
+        for kw, mapped in _PLACE_KEYWORDS.items():
+            if kw in place_raw:
+                place = mapped
+                break
+        if place is None:
+            place = place_raw  # use as-is if no keyword match
+        return target, place
+
+    # Pattern: "抓取X" / "拿起X" (no place, just grasp)
+    m = _re.search(r"(?:抓取|拿起|pick\s*(?:up)?)\s*(.+)", text)
+    if m:
+        target = m.group(1).strip()
+        return target, None
+
+    # Pattern: "把X放到Y" / "将X放到Y" / "把X放在Y"
+    m = _re.search(r"(?:把|将)\s*(.+?)\s*(?:放到|放在|放回|放到|放置到|移动到)\s*(.+)", text)
+    if m:
+        target = m.group(1).strip()
+        place_raw = m.group(2).strip()
+        for kw, mapped in _PLACE_KEYWORDS.items():
+            if kw in place_raw:
+                place = mapped
+                break
+        if place is None:
+            place = place_raw
+        return target, place
+
+    return None, None
+
+
 def _fast_route(task: str, bridge) -> list[dict] | None:
     """Return a pipeline for simple tasks, or None to fall through to LLM."""
-    text = task.strip().lower()
+    text = task.strip()
+    text_lower = text.lower()
     holding = bridge.get_holding()
 
+    # ── "抓取X并放到Y" / "抓取X" ──
+    target, place = _parse_pick_place(text)
+    if target:
+        pipeline = [
+            {"name": "go_home", "skill": "go_home", "args": {}},
+            {"name": "locate", "skill": "locate_object", "args": {"target": target}},
+            {"name": "grasp", "skill": "grasp_object", "args": {"x": "$locate.x", "y": "$locate.y", "z": "$locate.z"}},
+        ]
+        if place:
+            if place == "原位":
+                pipeline.append({"name": "place", "skill": "place_object", "args": {"x": "$locate.x", "y": "$locate.y", "z": "$locate.z"}})
+            else:
+                pipeline.append({"name": "resolve", "skill": "resolve_place", "args": {"place": place}})
+                pipeline.append({"name": "place", "skill": "place_object", "args": {"x": "$resolve.x", "y": "$resolve.y", "z": "$resolve.z"}})
+        return pipeline
+
     # ── "放下" / "放回原位" / "放置" ──
-    if any(w in text for w in ("放下", "放回", "放下来", "放置", "put down", "drop")):
+    if any(w in text_lower for w in ("放下", "放回", "放下来", "放置", "put down", "drop")):
         if not holding:
             return None  # will be caught as error by LLM
         ctx = bridge.get_task_context()
@@ -416,27 +420,27 @@ def _fast_route(task: str, bridge) -> list[dict] | None:
         ]
 
     # ── "回home" / "归位" / "回家" ──
-    if any(w in text for w in ("回home", "归位", "回家", "home", "go home")):
+    if any(w in text_lower for w in ("回home", "归位", "回家", "home", "go home")):
         return [{"name": "home", "skill": "go_home", "args": {}}]
 
     # ── "打开夹爪" / "松手" / "释放" ──
-    if any(w in text for w in ("打开夹爪", "松手", "释放", "open gripper", "release")):
+    if any(w in text_lower for w in ("打开夹爪", "松手", "释放", "open gripper", "release")):
         return [{"name": "open", "skill": "open_gripper", "args": {}}]
 
     # ── "闭合夹爪" / "夹紧" ──
-    if any(w in text for w in ("闭合夹爪", "夹紧", "close gripper")):
+    if any(w in text_lower for w in ("闭合夹爪", "夹紧", "close gripper")):
         return [{"name": "close", "skill": "close_gripper", "args": {}}]
 
     # ── "挥手" / "wave" / "摆动" ──
-    if any(w in text for w in ("挥手", "wave", "摆动", "打招呼", "摇手")):
+    if any(w in text_lower for w in ("挥手", "wave", "摆动", "打招呼", "摇手")):
         return [{"name": "wave", "skill": "wave", "args": {}}]
 
     # ── "点头" / "nod" ──
-    if any(w in text for w in ("点头", "nod")):
+    if any(w in text_lower for w in ("点头", "nod")):
         return [{"name": "nod", "skill": "nod", "args": {}}]
 
     # ── "握手" / "handshake" ──
-    if any(w in text for w in ("握手", "handshake")):
+    if any(w in text_lower for w in ("握手", "handshake")):
         return [{"name": "handshake", "skill": "handshake", "args": {}}]
 
     return None
@@ -459,9 +463,10 @@ class GraphResult:
 
 
 class GraphExecutor:
-    def __init__(self, bridge, vlm):
+    def __init__(self, bridge, vlm, yolo=None):
         self.bridge = bridge
         self.vlm = vlm
+        self.yolo = yolo
 
     def execute_task(self, task: str, params: dict[str, Any] | None = None) -> GraphResult:
         params = params or {}
@@ -499,7 +504,7 @@ class GraphExecutor:
                 return GraphResult(status="failed", error=f"Step {step['name']} missing args")
 
         # ── 6. Build + run graph ──
-        graph = build_graph(pipeline, self.bridge, self.vlm)
+        graph = build_graph(pipeline, self.bridge, self.vlm, self.yolo)
 
         initial: TaskState = {
             "pipeline": pipeline,

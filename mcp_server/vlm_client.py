@@ -1,7 +1,4 @@
-"""
-VLM HTTP client — extracted from vlm_picker_node.py.
-Stateless: takes image + target, returns detection result.
-"""
+"""Stateless VLM HTTP client for image-target detection."""
 
 import base64
 import json
@@ -12,6 +9,10 @@ import time
 import cv2
 import numpy as np
 import requests
+
+from .config import runtime_dir
+from .perception.color_detector import detect_by_color
+from .perception.debug import draw_bboxes
 
 
 def _safe_json_parse(text: str) -> dict:
@@ -64,7 +65,7 @@ def _safe_json_parse(text: str) -> dict:
             return {"found": True, "category": "other", "bbox": [int(n) for n in nums[:4]]}
     raise RuntimeError(f"VLM returned unparseable JSON: {text[:300]}")
 
-# ─────────────────────────── Grid overlay (from vlm_picker_node) ───────────────────────────
+# ─────────────────────────── Coordinate grid overlay ───────────────────────────
 def _add_coordinate_grid(img: np.ndarray, step: int = 50) -> np.ndarray:
     ann = img.copy()
     h, w = ann.shape[:2]
@@ -84,129 +85,7 @@ def _add_coordinate_grid(img: np.ndarray, step: int = 50) -> np.ndarray:
     return ann
 
 
-# ─────────────────────────── HSV colour detection (from vlm_picker_node) ───────────────────
-_COLOR_HSV_RANGES = {
-    "blue":   [((90, 80, 40),  (140, 255, 255))],
-    "red":    [((0, 100, 50),   (10, 255, 255)),
-               ((170, 100, 50), (180, 255, 255))],
-    "green":  [((35, 80, 40),   (85, 255, 255))],
-    "yellow": [((20, 100, 50),  (35, 255, 255))],
-    "purple": [((120, 80, 40),  (160, 255, 255))],
-    "orange": [((10, 100, 50),  (20, 255, 255))],
-    "cyan":   [((80, 80, 40),   (100, 255, 255))],
-}
-
-
-def _filter_by_location(candidates, hint, img_w, img_h):
-    if not hint or hint == "unknown":
-        return candidates
-    hint_l = hint.lower().replace("-", " ").strip()
-    result = []
-    for c in candidates:
-        cx, cy = c["cx"], c["cy"]
-        ok = True
-        if "left" in hint_l and cx > img_w * 0.6:
-            ok = False
-        if "right" in hint_l and cx < img_w * 0.4:
-            ok = False
-        if "top" in hint_l and cy > img_h * 0.6:
-            ok = False
-        if "bottom" in hint_l and cy < img_h * 0.4:
-            ok = False
-        if "center" in hint_l:
-            if not (img_w * 0.25 < cx < img_w * 0.75 and img_h * 0.25 < cy < img_h * 0.75):
-                ok = False
-        if ok:
-            result.append(c)
-    return result
-
-
-def _color_candidates(color_img: np.ndarray, color_name: str, include_alternatives: bool = False) -> list[dict]:
-    """OpenCV HSV colour detection → list of candidate dicts."""
-    hsv = cv2.cvtColor(color_img, cv2.COLOR_BGR2HSV)
-    h, w = color_img.shape[:2]
-    img_area = h * w
-
-    ranges = []
-    color_lower = color_name.lower()
-    if color_lower in _COLOR_HSV_RANGES:
-        ranges.extend(_COLOR_HSV_RANGES[color_lower])
-    if include_alternatives:
-        for alt in (["purple", "cyan"] if color_lower == "blue" else []):
-            if alt in _COLOR_HSV_RANGES:
-                ranges.extend(_COLOR_HSV_RANGES[alt])
-    if not ranges:
-        return []
-
-    combined_mask = None
-    for (lower, upper) in ranges:
-        mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
-        combined_mask = mask if combined_mask is None else cv2.bitwise_or(combined_mask, mask)
-
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    candidates = []
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < 200:
-            continue
-        if area > img_area * 0.3:
-            continue
-        x, y, bw, bh = cv2.boundingRect(cnt)
-        cx, cy = x + bw / 2, y + bh / 2
-        aspect = bw / max(bh, 1)
-        if aspect < 0.2 or aspect > 5.0:
-            continue
-        candidates.append({
-            "color": color_lower,
-            "area": area,
-            "x": x,
-            "y": y,
-            "xmax": x + bw,
-            "ymax": y + bh,
-            "cx": cx,
-            "cy": cy,
-        })
-    return candidates
-
-
-def detect_by_color(color_img: np.ndarray, color_name: str, location_hint: str = ""):
-    """OpenCV HSV colour detection → bbox (xmin,ymin,xmax,ymax) or None."""
-    h, w = color_img.shape[:2]
-    candidates = _color_candidates(color_img, color_name, include_alternatives=True)
-    if not candidates:
-        return None
-
-    filtered = _filter_by_location(candidates, location_hint, w, h) or candidates
-    best = max(filtered, key=lambda c: c["area"])
-    return (best["x"], best["y"], best["xmax"], best["ymax"])
-
-
-def detect_all_color_blocks(color_img: np.ndarray, location_hint: str = "") -> list[dict]:
-    """Detect all visible solid-colour blocks with OpenCV HSV detection."""
-    h, w = color_img.shape[:2]
-    blocks = []
-    for color_name in _COLOR_HSV_RANGES:
-        candidates = _color_candidates(color_img, color_name)
-        candidates = _filter_by_location(candidates, location_hint, w, h) or candidates
-        for c in candidates:
-            xmin, ymin, xmax, ymax = int(c["x"]), int(c["y"]), int(c["xmax"]), int(c["ymax"])
-            blocks.append({
-                "color": color_name,
-                "bbox": [xmin, ymin, xmax, ymax],
-                "center_2d": [int((xmin + xmax) / 2), int((ymin + ymax) / 2)],
-                "area_px": float(c["area"]),
-                "source": "CV",
-            })
-
-    blocks.sort(key=lambda b: b["area_px"], reverse=True)
-    return blocks
-
-
-# ─────────────────────────── Prompt template (from vlm_picker_node) ─────────────────────────
+# ─────────────────────────── Detection prompt template ─────────────────────────
 PROMPT_TEMPLATE = (
     "Task: Find the physical object '{target}' in this image.\n"
     "Context: You are a robot eye-in-hand camera. "
@@ -237,21 +116,6 @@ PROMPT_TEMPLATE = (
 )
 
 
-def _draw_bboxes(img: np.ndarray, bboxes: list[list[int]], labels: list[str] | None = None) -> np.ndarray:
-    """Draw bounding boxes on an image. bboxes: list of [xmin, ymin, xmax, ymax]."""
-    out = img.copy()
-    colors = [(0, 255, 0), (255, 0, 0), (0, 255, 255), (255, 255, 0), (255, 0, 255), (0, 128, 255)]
-    for i, b in enumerate(bboxes):
-        color = colors[i % len(colors)]
-        cv2.rectangle(out, (b[0], b[1]), (b[2], b[3]), color, 2)
-        cx, cy = (b[0] + b[2]) // 2, (b[1] + b[3]) // 2
-        cv2.circle(out, (cx, cy), 4, color, -1)
-        if labels and i < len(labels):
-            cv2.putText(out, labels[i], (b[0], b[1] - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-    return out
-
-
 class VlmClient:
     """Stateless VLM client — wraps Qwen / GPT-4V API call + OpenCV colour fallback."""
 
@@ -265,7 +129,7 @@ class VlmClient:
         self.api_key = api_key or os.environ.get("VLM_API_KEY")
         self.api_url = api_url or os.environ.get("VLM_API_URL")
         self.model_name = model_name or os.environ.get("VLM_MODEL")
-        self.debug_dir = debug_dir or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tmp")
+        self.debug_dir = debug_dir or os.environ.get("VLM_DEBUG_DIR", str(runtime_dir("debug")))
         os.makedirs(self.debug_dir, exist_ok=True)
         if not self.api_key:
             raise RuntimeError(
@@ -275,7 +139,7 @@ class VlmClient:
     def _save_debug(self, image_bgr: np.ndarray, bboxes: list[list[int]],
                     labels: list[str] | None = None, prefix: str = "detect") -> str:
         """Save image with bboxes drawn. Returns file path."""
-        annotated = _draw_bboxes(image_bgr, bboxes, labels)
+        annotated = draw_bboxes(image_bgr, bboxes, labels)
         ts = time.strftime("%Y%m%d_%H%M%S")
         path = os.path.join(self.debug_dir, f"{prefix}_{ts}.jpg")
         cv2.imwrite(path, annotated)

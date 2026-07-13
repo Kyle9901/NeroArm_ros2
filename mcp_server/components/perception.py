@@ -6,6 +6,9 @@ from itertools import count
 from typing import TYPE_CHECKING
 
 from .base import ComponentResult, ImageFrame
+from ..config import runtime_dir
+from ..perception.color_detector import detect_all_color_blocks, detect_by_color as detect_color_bbox
+from ..perception.debug import draw_bboxes
 
 if TYPE_CHECKING:
     from ..ros_bridge import RobotBridge
@@ -13,16 +16,14 @@ if TYPE_CHECKING:
     from ..yolo_detector import YoloDetector
 
 
-_DEBUG_DIR = os.environ.get("VLM_DEBUG_DIR", "/tmp/vlm_debug")
+_DEBUG_DIR = os.environ.get("VLM_DEBUG_DIR", str(runtime_dir("debug")))
 _FRAME_IDS = count(1)
 
 
 def _save_debug(img, bboxes, labels, prefix="detect") -> str:
     import cv2
-    from ..vlm_client import _draw_bboxes
-
     os.makedirs(_DEBUG_DIR, exist_ok=True)
-    annotated = _draw_bboxes(img, bboxes, labels)
+    annotated = draw_bboxes(img, bboxes, labels)
     now = time.time()
     ts = time.strftime("%Y%m%d_%H%M%S", time.localtime(now))
     ms = int((now % 1) * 1000)
@@ -46,9 +47,7 @@ def capture_image(bridge: "RobotBridge", timeout: float = 3.0) -> ComponentResul
 
 
 def detect_by_color(frame: ImageFrame, color_name: str, location_hint: str = "") -> ComponentResult:
-    from ..vlm_client import detect_by_color as _detect_by_color
-
-    bbox = _detect_by_color(frame.color, color_name, location_hint)
+    bbox = detect_color_bbox(frame.color, color_name, location_hint)
     if bbox is None:
         return ComponentResult.success(found=False, color=color_name, source="CV")
     xmin, ymin, xmax, ymax = bbox
@@ -64,8 +63,6 @@ def detect_by_color(frame: ImageFrame, color_name: str, location_hint: str = "")
 
 
 def detect_all_blocks(frame: ImageFrame, location_hint: str = "") -> ComponentResult:
-    from ..vlm_client import detect_all_color_blocks
-
     blocks = detect_all_color_blocks(frame.color, location_hint)
     if not blocks:
         return ComponentResult.success(found=False, count=0, blocks=[], source="CV")
@@ -160,11 +157,10 @@ def bbox_to_3d(bridge: "RobotBridge", frame: ImageFrame,
     """Compute 3D position from a bounding box using progressive ROI expansion.
 
     Strategy (see yolo-integration-plan.md #8):
-      1. Shrink bbox by 10% → take median depth of the inner ROI
-      2. If #1 fails → shrink by 20%
-      3. If #2 fails → expand bbox outward by 20px (catch desk surface near object)
-      4. If #3 fails → try full image for nearest valid depth near bbox center
-      5. If all fail → return failure
+      1. Shrink bbox by 30% → take median depth of inner ROI (stable center)
+      2. If #1 fails → shrink by 10% → take median
+      3. If #2 fails → expand bbox outward by 20px
+      4. If #3 fails → center point fallback
 
     Uses the median depth to find the pixel closest to the median,
     ensuring the 3D point lands on the actual object surface, not a hole.
@@ -197,7 +193,7 @@ def bbox_to_3d(bridge: "RobotBridge", frame: ImageFrame,
     cy = int((ymin + ymax) / 2)
 
     def _median_3d(roi_xmin, roi_xmax, roi_ymin, roi_ymax):
-        """Extract ROI, compute median depth, find pixel closest to median, return 3D."""
+        """Extract ROI, compute median depth, compute 3D at bbox center."""
         rx1 = max(0, roi_xmin)
         rx2 = min(dw, roi_xmax + 1)
         ry1 = max(0, roi_ymin)
@@ -206,18 +202,50 @@ def bbox_to_3d(bridge: "RobotBridge", frame: ImageFrame,
         valid = roi[roi > 0]
         if len(valid) == 0:
             return None
-        median_mm = float(np.median(valid))
-        # Find the pixel closest to the median depth
-        diff = np.abs(roi.astype(np.float32) - median_mm)
-        diff[roi <= 0] = np.inf
-        min_idx = np.unravel_index(np.argmin(diff), diff.shape)
-        u_real = rx1 + min_idx[1]
-        v_real = ry1 + min_idx[0]
-        return pixel_to_3d(bridge, frame, u_real, v_real), median_mm
 
-    # Step 1: Shrink by 10%
+        # Median depth of inner ROI → object surface depth
+        depth_mm = float(np.median(valid))
+
+        # Always deproject at the geometric bbox center.  The depth value comes
+        # from the whole inner ROI, so the center pixel itself does not need to
+        # contain a valid depth sample.  Searching for the first valid pixel
+        # made sparse-depth objects jump in X/Y (and in base-frame Z when the
+        # camera is tilted), even when bbox and median depth were unchanged.
+        u_center = cx
+        v_center = cy
+
+        cinfo = bridge.node.get_color_info()
+        if cinfo is None:
+            return None
+        z_c = depth_mm / 1000.0
+        x_c = (u_center - cinfo["cx"]) * z_c / cinfo["fx"]
+        y_c = (v_center - cinfo["cy"]) * z_c / cinfo["fy"]
+        try:
+            base = bridge.node.transform_to_base(x_c, y_c, z_c)
+        except Exception:
+            return None
+        return ComponentResult.success(
+            x=base["x"], y=base["y"], z=base["z"],
+            frame_id="base_link",
+            depth_mm=depth_mm,
+            valid_depth_points=len(valid),
+        ), depth_mm
+
+    # Step 1: Shrink by 30% (aggressive: inner ROI is mostly object surface)
     bw = xmax - xmin
     bh = ymax - ymin
+    shrink_x = max(1, int(bw * 0.30))
+    shrink_y = max(1, int(bh * 0.30))
+    result = _median_3d(xmin + shrink_x, xmax - shrink_x,
+                        ymin + shrink_y, ymax - shrink_y)
+    if result is not None:
+        pos, depth_mm = result
+        if pos.ok:
+            pos.data["depth_mm"] = depth_mm
+            pos.data["method"] = "bbox_shrink_30pct"
+            return pos
+
+    # Step 2: Shrink by 10% (relaxed)
     shrink10_x = max(1, int(bw * 0.10))
     shrink10_y = max(1, int(bh * 0.10))
     result = _median_3d(xmin + shrink10_x, xmax - shrink10_x,
@@ -227,18 +255,6 @@ def bbox_to_3d(bridge: "RobotBridge", frame: ImageFrame,
         if pos.ok:
             pos.data["depth_mm"] = depth_mm
             pos.data["method"] = "bbox_shrink_10pct"
-            return pos
-
-    # Step 2: Shrink by 20%
-    shrink20_x = max(1, int(bw * 0.20))
-    shrink20_y = max(1, int(bh * 0.20))
-    result = _median_3d(xmin + shrink20_x, xmax - shrink20_x,
-                        ymin + shrink20_y, ymax - shrink20_y)
-    if result is not None:
-        pos, depth_mm = result
-        if pos.ok:
-            pos.data["depth_mm"] = depth_mm
-            pos.data["method"] = "bbox_shrink_20pct"
             return pos
 
     # Step 3: Expand outward by 20px (catch desk surface near object)

@@ -1,14 +1,15 @@
 """Shared result types for atomic components."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
+
+from ..models import OperationResult
 
 
 @dataclass
-class ComponentResult:
-    ok: bool
-    data: dict[str, Any] = field(default_factory=dict)
-    error: str | None = None
+class ComponentResult(OperationResult):
+    """Result of one atomic hardware or perception operation."""
+
     fatal: bool = False
 
     @classmethod

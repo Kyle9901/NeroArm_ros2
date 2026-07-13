@@ -30,19 +30,20 @@ def _load_env():
                     key, _, val = line.partition("=")
                     val = val.strip().strip('"').strip("'")
                     val = val.replace("${PYTHONPATH}", os.environ.get("PYTHONPATH", ""))
-                    os.environ.setdefault(key.strip(), val)
+                    os.environ[key.strip()] = val
 
 _load_env()  # must run before imports that read env vars
 
 from mcp_server.ros_bridge import RobotBridge
 from mcp_server.vlm_client import VlmClient
+from mcp_server.yolo_detector import YoloDetector
 from mcp_server.orchestrator.graph import GraphExecutor
 from mcp_server.orchestrator.planner import SKILL_SCHEMA, FEW_SHOT_EXAMPLES
 
 
 def main():
     parser = argparse.ArgumentParser(description="Test MCP task server")
-    parser.add_argument("task", nargs="?", default="把蓝色方块放到右边")
+    parser.add_argument("task", nargs="?", default="")
     parser.add_argument("--target", default=None)
     parser.add_argument("--place", default=None)
     parser.add_argument("--list", action="store_true", help="List skills and examples")
@@ -63,25 +64,34 @@ def main():
     bridge.start()
     print("[init] ready", file=sys.stderr, flush=True)
 
-    params = {}
-    if args.target:
-        params["target"] = args.target
-    if args.place:
-        params["place"] = args.place
+    try:
+        # Initialize YOLO (best-effort)
+        yolo = None
+        try:
+            yolo = YoloDetector()
+            print("[init] YOLO ready", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[init] YOLO unavailable: {e}", file=sys.stderr, flush=True)
 
-    executor = GraphExecutor(bridge, vlm)
-    t0 = time.monotonic()
-    result = executor.execute_task(args.task, params=params)
-    elapsed = time.monotonic() - t0
+        params = {}
+        if args.target:
+            params["target"] = args.target
+        if args.place:
+            params["place"] = args.place
 
-    print(f"status: {result.status}")
-    print(f"time: {elapsed:.1f}s")
-    print(f"holding: {bridge.get_holding()}")
-    if result.error:
-        print(f"error: {result.error}")
-    print(f"output: {json.dumps(result.user_output, ensure_ascii=False)}")
+        executor = GraphExecutor(bridge, vlm, yolo)
+        t0 = time.monotonic()
+        result = executor.execute_task(args.task, params=params)
+        elapsed = time.monotonic() - t0
 
-    bridge.shutdown()
+        print(f"status: {result.status}")
+        print(f"time: {elapsed:.1f}s")
+        print(f"holding: {bridge.get_holding()}")
+        if result.error:
+            print(f"error: {result.error}")
+        print(f"output: {json.dumps(result.user_output, ensure_ascii=False)}")
+    finally:
+        bridge.shutdown()
 
 
 if __name__ == "__main__":

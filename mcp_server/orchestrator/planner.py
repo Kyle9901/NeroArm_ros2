@@ -277,7 +277,7 @@ def plan_pipeline(task: str, extra_context: str = "") -> list[dict] | None:
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        "max_tokens": 500,
+        "max_tokens": 2000,
         "temperature": 0.1,
     }
     headers = {
@@ -303,7 +303,14 @@ def plan_pipeline(task: str, extra_context: str = "") -> list[dict] | None:
         raise RuntimeError(f"Planning LLM HTTP {resp.status_code}: {resp.text[:300]}")
 
     body = resp.json()
-    text = body["choices"][0]["message"]["content"]
+    msg = body["choices"][0]["message"]
+    text = msg.get("content", "").strip()
+
+    # DeepSeek reasoning models: content may be empty if reasoning consumed all tokens.
+    # Fall back to reasoning_content and try to extract JSON from the reasoning traces.
+    if not text and "reasoning_content" in msg:
+        text = msg["reasoning_content"].strip()
+
     parsed = _extract_json(text)
     if parsed is None:
         raise RuntimeError(f"Planning LLM returned unparseable output:\n{text[:500]}")

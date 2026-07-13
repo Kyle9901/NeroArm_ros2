@@ -11,7 +11,7 @@ import asyncio
 import os
 import sys
 import traceback
-import uuid
+from dataclasses import dataclass, field
 from typing import Any
 
 _pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -24,9 +24,10 @@ from mcp.types import Tool
 
 from .ros_bridge import RobotBridge
 from .vlm_client import VlmClient
+from .yolo_detector import YoloDetector
 from .orchestrator.graph import GraphExecutor
 from .skills.prepare import prepare as prepare_skill
-from .tools import tools as _tools
+from . import api_services
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════
@@ -108,8 +109,10 @@ TOOL_DEFINITIONS = [
     {
         "name": "arm_configure_vlm",
         "description": (
-            "Configure VLM API settings at runtime. Use this to set/change VLM API key, API URL, or model "
-            "without restarting the MCP server. Leave a field empty to keep its current value."
+            "Configure VLM and YOLO settings at runtime. "
+            "Use this to set/change VLM API key, API URL, model, YOLO confidence threshold, "
+            "or toggle VLM fallback without restarting the MCP server. "
+            "Leave a field empty to keep its current value."
         ),
         "inputSchema": {
             "type": "object",
@@ -117,6 +120,8 @@ TOOL_DEFINITIONS = [
                 "api_key": {"type": "string", "description": "VLM API key. Leave empty to keep current."},
                 "api_url": {"type": "string", "description": "VLM API endpoint URL. Leave empty to keep current."},
                 "model": {"type": "string", "description": "VLM model name. Leave empty to keep current."},
+                "yolo_confidence": {"type": "number", "description": "YOLO confidence threshold (0.0-1.0). Leave empty to keep current."},
+                "vlm_fallback": {"type": "boolean", "description": "Enable/disable VLM fallback when YOLO fails."},
             },
             "required": [],
         },
@@ -138,7 +143,7 @@ TOOL_DEFINITIONS = [
 # ═══════════════════════════════════════════════════════════════════════════════════════════
 
 def _call_tool(name: str, args: dict, bridge: RobotBridge, vlm: VlmClient,
-               executor: GraphExecutor, sessions: dict) -> dict:
+               yolo: YoloDetector | None, executor: GraphExecutor, sessions: dict) -> dict:
     try:
         if name == "arm_execute_task":
             return _execute_task(args, executor, sessions)
@@ -149,20 +154,18 @@ def _call_tool(name: str, args: dict, bridge: RobotBridge, vlm: VlmClient,
                 calib_name=args.get("calib_name", "my_eih_calib_v6"),
             ))
         if name == "arm_get_status":
-            return _tools.arm_get_status(bridge)
+            return api_services.get_status(bridge)
         if name == "arm_stop":
             bridge.reset_task_context()
-            return _tools.arm_stop(bridge)
+            return api_services.stop(bridge)
         if name == "arm_reset_context":
             bridge.reset_task_context()
             return {"success": True, "message": "task context reset"}
         if name == "arm_configure_vlm":
-            return _tools.arm_configure_vlm(
-                bridge,
-                vlm,
-                args.get("api_key"),
-                args.get("api_url"),
-                args.get("model"),
+            return api_services.configure_runtime(
+                vlm, yolo,
+                args.get("api_key"), args.get("api_url"), args.get("model"),
+                args.get("yolo_confidence"), args.get("vlm_fallback"),
             )
         return {"success": False, "error": f"Unknown tool: {name}"}
     except Exception as e:
@@ -234,24 +237,44 @@ def _resume_task(session_id: str, answer: dict | None,
 #  MCP server
 # ═══════════════════════════════════════════════════════════════════════════════════════════
 
-_bridge: RobotBridge | None = None
-_vlm: VlmClient | None = None
-_executor: GraphExecutor | None = None
-_sessions: dict[str, dict] = {}
+@dataclass
+class AppContext:
+    bridge: RobotBridge
+    vlm: VlmClient
+    yolo: YoloDetector | None
+    executor: GraphExecutor
+    sessions: dict[str, dict] = field(default_factory=dict)
+
+
+_app: AppContext | None = None
 
 
 async def _async_main():
-    global _bridge, _vlm, _executor, _sessions
+    global _app
     print("[robot-arm] Starting MCP server (orchestration mode)...", file=sys.stderr)
-    _vlm = VlmClient()
-    if not _vlm.api_key:
+    vlm = VlmClient()
+    if not vlm.api_key:
         print("[robot-arm] WARNING: VLM_API_KEY not set.", file=sys.stderr)
-    _bridge = RobotBridge()
+
+    # ── YOLO detector (Fail Fast on load failure) ──
+    try:
+        yolo = YoloDetector()
+        print("[robot-arm] YOLO detector loaded.", file=sys.stderr)
+    except Exception as e:
+        print(f"[robot-arm] WARNING: YOLO init failed: {e}", file=sys.stderr)
+        print("[robot-arm] Continuing without YOLO — HSV + VLM only.", file=sys.stderr)
+        yolo = None
+
+    bridge = RobotBridge()
     print("[robot-arm] Connecting to ROS 2...", file=sys.stderr)
-    _bridge.start()
+    bridge.start()
     print("[robot-arm] ROS 2 bridge ready.", file=sys.stderr)
-    _executor = GraphExecutor(_bridge, _vlm)
-    _sessions = {}
+    _app = AppContext(
+        bridge=bridge,
+        vlm=vlm,
+        yolo=yolo,
+        executor=GraphExecutor(bridge, vlm, yolo),
+    )
 
     server = Server("robot-arm")
 
@@ -261,7 +284,10 @@ async def _async_main():
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict[str, Any]) -> dict:
-        return _call_tool(name, arguments, _bridge, _vlm, _executor, _sessions)
+        return _call_tool(
+            name, arguments, _app.bridge, _app.vlm, _app.yolo,
+            _app.executor, _app.sessions,
+        )
 
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
@@ -269,8 +295,8 @@ async def _async_main():
 
 def main():
     asyncio.run(_async_main())
-    if _bridge:
-        _bridge.shutdown()
+    if _app:
+        _app.bridge.shutdown()
     print("[robot-arm] Server stopped.", file=sys.stderr)
 
 

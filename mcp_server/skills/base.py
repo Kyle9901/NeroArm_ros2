@@ -1,7 +1,9 @@
 """Shared types and geometry helpers for skills."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
+
+from ..models import OperationResult
 
 if TYPE_CHECKING:
     from ..ros_bridge import RobotBridge
@@ -36,16 +38,19 @@ class GraspGeometry:
     def is_holding(self, width: float | None) -> bool:
         return width is not None and width > self.gripper_close + self.hold_margin
 
+    def grasp_z(self, surface_z: float) -> float:
+        """TCP flange Z for grasping: fingertip = surface_z - grasp_depth."""
+        return surface_z + self.flange_to_tip - self.grasp_depth
+
 
 @dataclass
-class SkillResult:
-    ok: bool
+class SkillResult(OperationResult):
+    """Operation result extended with task recovery and holding state."""
+
     holding: bool | None = None
     recovered: bool = False
     retryable: bool = False
     failed_step: str | None = None
-    data: dict[str, Any] = field(default_factory=dict)
-    error: str | None = None
 
     @classmethod
     def success(cls, *, holding: bool | None = None, **data: Any) -> "SkillResult":

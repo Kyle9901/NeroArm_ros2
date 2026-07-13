@@ -33,7 +33,28 @@ def grasp_object(bridge: "RobotBridge", x: float, y: float, z: float,
         return _fail(check.error or "Target outside workspace", "workspace_check", retryable=False)
 
     print(f"[grasp] target: x={x:.4f}, y={y:.4f}, z={z:.4f}, "
-          f"approach_z={z + geo.approach_height:.4f}, grasp_z={z + geo.grasp_depth:.4f}", flush=True)
+          f"approach_z={z + geo.approach_height:.4f}, grasp_z={geo.grasp_z(z):.4f} "
+          f"(fingertip={z - geo.grasp_depth:.4f})", flush=True)
+
+    # Safety: clamp fingertip to desk surface (don't go below the desk)
+    desk_z = bridge.node._get_param("desk_z_surface")
+    fingertip_z = z - geo.grasp_depth
+    if fingertip_z < desk_z:
+        clamped_depth = z - desk_z
+        print(f"[grasp] WARNING: fingertip {fingertip_z:.4f} below desk {desk_z:.4f}, "
+              f"clamping grasp_depth {geo.grasp_depth:.3f}→{clamped_depth:.3f}", flush=True)
+        geo = GraspGeometry.from_bridge(bridge)
+        geo = GraspGeometry(
+            flange_to_tip=geo.flange_to_tip,
+            grasp_depth=clamped_depth,
+            approach_height=geo.approach_height,
+            safe_height=geo.safe_height,
+            gripper_open=geo.gripper_open,
+            gripper_close=geo.gripper_close,
+            hold_margin=geo.hold_margin,
+            descent_vel=geo.descent_vel,
+            descent_accel=geo.descent_accel,
+        )
 
     # 清理上一次残留的 CollisionObject 和 ACM
     bridge.node.remove_target_collision(object_id)
@@ -55,7 +76,7 @@ def grasp_object(bridge: "RobotBridge", x: float, y: float, z: float,
         return _fail(result.error or "approach failed", "approach")
 
     result = motion.move_cartesian(
-        bridge, x, y, z + geo.grasp_depth, quat,
+        bridge, x, y, geo.grasp_z(z), quat,
         velocity=geo.descent_vel, accel=geo.descent_accel)
     if not result.ok:
         recovered = recover_to_safe(bridge, x, y, geo, quat)
@@ -113,7 +134,7 @@ def place_object(bridge: "RobotBridge", x: float, y: float, z: float,
     if not result.ok:
         return _fail(result.error or "move above failed", "move_above")
 
-    result = motion.move_cartesian(bridge, x, y, z + geo.grasp_depth, quat)
+    result = motion.move_cartesian(bridge, x, y, geo.grasp_z(z), quat)
     if not result.ok:
         recovered = recover_to_safe(bridge, x, y, geo, quat)
         return _fail(result.error or "descent failed", "descent", recovered=recovered)
