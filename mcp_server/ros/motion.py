@@ -1,7 +1,6 @@
 """MoveIt planning, execution, workspace checks, and goal tracking."""
 
 import math
-import time
 
 from geometry_msgs.msg import Pose
 from moveit_msgs import action as _ma
@@ -11,6 +10,7 @@ from rclpy.action import ActionClient
 from shape_msgs.msg import SolidPrimitive
 
 from .hardware import ARM_JOINT_NAMES, GripperController
+from .futures import wait_for_future
 
 _ERROR_HINTS = {
     -1: "Planning failed; target may be unreachable or in collision",
@@ -58,14 +58,9 @@ class MotionControllerMixin:
                 self._workspace_y_min <= y <= self._workspace_y_max)
 
     # ─────────────────────────── motion implementation ────────────
-    @staticmethod
-    def _spin_until(future, timeout_sec):
-        t0 = time.time()
-        while not future.done():
-            if time.time() - t0 > timeout_sec:
-                return False
-            time.sleep(0.02)
-        return True
+    def _spin_until(self, future, timeout_sec):
+        """Compatibility wrapper for ROS adapters sharing the node."""
+        return wait_for_future(future, timeout_sec, context=self.context)
 
     @property
     def _workspace_x_min(self):
@@ -280,6 +275,10 @@ class MotionControllerMixin:
                            "This is a MoveIt internal error — try arm_go_home to reset")
         if resp.error_code.val != MoveItErrorCodes.SUCCESS:
             return False, _friendly_error("cartesian_path planning failed", resp.error_code.val)
+        self.get_logger().info(
+            f"Cartesian path: target_z={z:.4f}, fraction={resp.fraction:.1%}, "
+            f"required={self._get_param('cartesian_min_fraction'):.1%}"
+        )
         if resp.fraction < self._get_param("cartesian_min_fraction"):
             return False, (f"cartesian path only {resp.fraction:.0%} reachable "
                            f"(needs {self._get_param('cartesian_min_fraction'):.0%}). "

@@ -3,8 +3,7 @@
 MCP Server for AGX Robot Arm — new agent/orchestration entry point.
 Usage: python -m mcp_server.task_server
 
-OpenClaw only sees the new high-level tools here. Legacy implementations remain
-in tools/tools.py as an internal backup, but are not exposed as MCP tools.
+OpenClaw only sees the high-level tools defined in this module.
 """
 
 import asyncio
@@ -24,7 +23,7 @@ from mcp.types import Tool
 
 from .ros_bridge import RobotBridge
 from .vlm_client import VlmClient
-from .yolo_detector import YoloDetector
+from .yolo_detector import LazyYoloDetector, YoloDetector
 from .orchestrator.graph import GraphExecutor
 from .skills.prepare import prepare as prepare_skill
 from . import api_services
@@ -80,7 +79,8 @@ TOOL_DEFINITIONS = [
     {
         "name": "arm_prepare",
         "description": (
-            "Prepare the robot system for task execution. Starts or checks arm, camera, and hand-eye TF nodes. "
+            "Prepare the robot system for task execution. Starts or checks arm, camera, hand-eye TF, "
+            "point-cloud filter, and OctoMap gate nodes. "
             "Call this once at the start of a session before arm_execute_task. "
             "If everything is already ready, it returns immediately."
         ),
@@ -88,7 +88,7 @@ TOOL_DEFINITIONS = [
             "type": "object",
             "properties": {
                 "can_port": {"type": "string", "description": "CAN interface name. Default: can0."},
-                "calib_name": {"type": "string", "description": "Hand-eye calibration name. Default: my_eih_calib_v6."},
+                "calib_name": {"type": "string", "description": "Hand-eye calibration name. Default: my_eih_calib_park."},
             },
             "required": [],
         },
@@ -100,6 +100,23 @@ TOOL_DEFINITIONS = [
             "safe height, desk surface Z, and grasp geometry parameters."
         ),
         "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "arm_configure_octomap",
+        "description": (
+            "Enable or disable MoveIt OctoMap collision mapping at runtime. "
+            "Disabling stops cloud updates and clears existing voxels; enabling resumes updates."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "description": "true to enable OctoMap, false to disable and clear it.",
+                },
+            },
+            "required": ["enabled"],
+        },
     },
     {
         "name": "arm_stop",
@@ -151,10 +168,12 @@ def _call_tool(name: str, args: dict, bridge: RobotBridge, vlm: VlmClient,
             return _skill_result_to_dict(prepare_skill(
                 bridge,
                 can_port=args.get("can_port", "can0"),
-                calib_name=args.get("calib_name", "my_eih_calib_v6"),
+                calib_name=args.get("calib_name", "my_eih_calib_park"),
             ))
         if name == "arm_get_status":
             return api_services.get_status(bridge)
+        if name == "arm_configure_octomap":
+            return api_services.configure_octomap(bridge, args["enabled"])
         if name == "arm_stop":
             bridge.reset_task_context()
             return api_services.stop(bridge)
@@ -256,14 +275,8 @@ async def _async_main():
     if not vlm.api_key:
         print("[robot-arm] WARNING: VLM_API_KEY not set.", file=sys.stderr)
 
-    # ── YOLO detector (Fail Fast on load failure) ──
-    try:
-        yolo = YoloDetector()
-        print("[robot-arm] YOLO detector loaded.", file=sys.stderr)
-    except Exception as e:
-        print(f"[robot-arm] WARNING: YOLO init failed: {e}", file=sys.stderr)
-        print("[robot-arm] Continuing without YOLO — HSV + VLM only.", file=sys.stderr)
-        yolo = None
+    yolo = LazyYoloDetector()
+    print("[robot-arm] YOLO will load on first use.", file=sys.stderr)
 
     bridge = RobotBridge()
     print("[robot-arm] Connecting to ROS 2...", file=sys.stderr)

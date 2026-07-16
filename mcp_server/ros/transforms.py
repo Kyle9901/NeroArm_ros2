@@ -13,6 +13,19 @@ class TransformService:
         self.buffer = Buffer()
         self.listener = TransformListener(self.buffer, node)
 
+    def can_transform(
+        self,
+        source_frame: str,
+        target_frame: str = "base_link",
+        timeout: float = 1.0,
+    ) -> bool:
+        return self.buffer.can_transform(
+            target_frame,
+            source_frame,
+            Time(),
+            Duration(seconds=timeout),
+        )
+
     def transform_point(
         self,
         x: float,
@@ -21,19 +34,21 @@ class TransformService:
         *,
         source_frame: str = "camera_color_optical_frame",
         target_frame: str = "base_link",
+        stamp=None,
         timeout: float = 1.0,
     ) -> dict:
         point = PointStamped()
         point.header.frame_id = source_frame
-        point.header.stamp = self._node.get_clock().now().to_msg()
+        point.header.stamp = stamp or self._node.get_clock().now().to_msg()
         point.point.x = x
         point.point.y = y
         point.point.z = z
 
+        query_time = Time.from_msg(stamp) if stamp is not None else Time()
         transform = self.buffer.lookup_transform(
             target_frame,
             source_frame,
-            Time(),
+            query_time,
             Duration(seconds=timeout),
         )
         transformed = do_transform_point(point, transform)

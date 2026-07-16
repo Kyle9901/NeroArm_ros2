@@ -27,9 +27,10 @@ from mcp_server.skills.perception import _target_color
 _OUTPUT_DIR = str(runtime_dir("depth_test"))
 
 
-def _sample_roi(bridge, depth_img: np.ndarray, roi: tuple[int, int, int, int]):
+def _sample_roi(bridge, frame, roi: tuple[int, int, int, int]):
     """Return depth and 3D position using a real median-depth pixel in an ROI."""
     x1, y1, x2, y2 = roi
+    depth_img = frame.depth
     patch = depth_img[y1:y2, x1:x2]
     ys, xs = np.nonzero(patch > 0)
     if len(xs) == 0:
@@ -43,7 +44,11 @@ def _sample_roi(bridge, depth_img: np.ndarray, roi: tuple[int, int, int, int]):
     cam = bridge.node.compute_3d(u, v, depth_img, margin_px=0)
     if cam is None:
         return None
-    base = bridge.node.transform_to_base(cam["x_c"], cam["y_c"], cam["z_c"])
+    base = bridge.node.transform_to_base(
+        cam["x_c"], cam["y_c"], cam["z_c"],
+        stamp=frame.ros_stamp,
+        source_frame=frame.source_frame,
+    )
     return {
         "roi": roi,
         "pixel": (u, v),
@@ -99,7 +104,10 @@ def main() -> int:
             return 1
         bbox = [int(value) for value in detected.data["bbox"]]
 
-        object_pos = perception.bbox_to_3d(bridge, frame, bbox)
+        object_pos = perception.bbox_to_3d(
+            bridge, frame, bbox,
+            known_object_height=bridge.get_color_block_height(),
+        )
         if not object_pos.ok:
             print(f"object depth failed: {object_pos.error}")
             return 1
@@ -108,7 +116,7 @@ def main() -> int:
         desk_samples = []
         for name, roi in _desk_rois(bbox, depth_w, depth_h).items():
             try:
-                sample = _sample_roi(bridge, frame.depth, roi)
+                sample = _sample_roi(bridge, frame, roi)
             except Exception as exc:
                 print(f"desk_{name}: transform failed: {exc}")
                 continue
@@ -137,7 +145,12 @@ def main() -> int:
         obj = object_pos.data
         print(f"target={target}  color={color_name}  bbox={bbox}")
         print(f"object: depth_mm={obj['depth_mm']:.1f}  valid_points={obj['valid_depth_points']} "
-              f"base_xyz=({obj['x']:.4f}, {obj['y']:.4f}, {obj['z']:.4f})")
+              f"base_xyz=({obj['x']:.4f}, {obj['y']:.4f}, {obj['z']:.4f}) "
+              f"method={obj.get('method', '?')}")
+        if obj.get("depth_is_estimated"):
+            print(f"object_depth_source=local_desk+known_height "
+                  f"local_desk_z={obj['local_desk_z']:.4f} "
+                  f"configured_height={obj['object_height']:.4f}")
         for sample in desk_samples:
             print(f"desk_{sample['name']}: depth_mm={sample['depth_mm']:.1f} "
                   f"valid_points={sample['valid_points']} pixel={sample['pixel']} "
@@ -146,7 +159,8 @@ def main() -> int:
         if desk_samples:
             desk_z = float(np.median([sample["z"] for sample in desk_samples]))
             print(f"local_desk_z_median={desk_z:.4f}")
-            print(f"object_height_above_local_desk={(obj['z'] - desk_z):.4f} m")
+            reference_desk_z = obj.get("local_desk_z", desk_z)
+            print(f"object_height_above_local_desk={(obj['z'] - reference_desk_z):.4f} m")
         else:
             print("no valid surrounding desk samples")
         print(f"debug_image={output_path}")

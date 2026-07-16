@@ -27,3 +27,5 @@ class ImageFrame:
     color: Any
     depth: Any
     timestamp_s: float
+    ros_stamp: Any = None
+    source_frame: str = "camera_color_optical_frame"

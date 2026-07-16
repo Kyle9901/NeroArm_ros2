@@ -47,7 +47,13 @@ def _with_bbox_3d(bridge: "RobotBridge", frame, detection: dict) -> SkillResult:
     bbox = detection.get("bbox")
     if not bbox:
         return _with_3d(bridge, frame, detection)
-    pos = perception.bbox_to_3d(bridge, frame, bbox)
+    known_height = (
+        bridge.get_color_block_height()
+        if detection.get("source") == "CV" and detection.get("color") else None
+    )
+    pos = perception.bbox_to_3d(
+        bridge, frame, bbox, known_object_height=known_height,
+    )
     if not pos.ok:
         # Fallback to center point
         return _with_3d(bridge, frame, detection)

@@ -36,7 +36,7 @@ _load_env()  # must run before imports that read env vars
 
 from mcp_server.ros_bridge import RobotBridge
 from mcp_server.vlm_client import VlmClient
-from mcp_server.yolo_detector import YoloDetector
+from mcp_server.yolo_detector import LazyYoloDetector
 from mcp_server.orchestrator.graph import GraphExecutor
 from mcp_server.orchestrator.planner import SKILL_SCHEMA, FEW_SHOT_EXAMPLES
 
@@ -46,6 +46,14 @@ def main():
     parser.add_argument("task", nargs="?", default="")
     parser.add_argument("--target", default=None)
     parser.add_argument("--place", default=None)
+    parser.add_argument(
+        "--calib-name", default=None,
+        help="easy_handeye2 calibration name used by prepare",
+    )
+    parser.add_argument(
+        "--octomap", action=argparse.BooleanOptionalAction, default=None,
+        help="enable or disable OctoMap for this test run",
+    )
     parser.add_argument("--list", action="store_true", help="List skills and examples")
     args = parser.parse_args()
 
@@ -65,19 +73,18 @@ def main():
     print("[init] ready", file=sys.stderr, flush=True)
 
     try:
-        # Initialize YOLO (best-effort)
-        yolo = None
-        try:
-            yolo = YoloDetector()
-            print("[init] YOLO ready", file=sys.stderr, flush=True)
-        except Exception as e:
-            print(f"[init] YOLO unavailable: {e}", file=sys.stderr, flush=True)
+        yolo = LazyYoloDetector()
+        print("[init] YOLO lazy loader ready", file=sys.stderr, flush=True)
 
         params = {}
         if args.target:
             params["target"] = args.target
         if args.place:
             params["place"] = args.place
+        if args.calib_name:
+            params["calib_name"] = args.calib_name
+        if args.octomap is not None:
+            params["octomap_enabled"] = args.octomap
 
         executor = GraphExecutor(bridge, vlm, yolo)
         t0 = time.monotonic()

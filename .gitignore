@@ -39,3 +39,7 @@ Log/
 
 # MCP 启动脚本 (含 API key, 不提交)
 scripts/run_mcp.sh
+.env
+.env.*
+!.env.example
+scripts/*.local.sh

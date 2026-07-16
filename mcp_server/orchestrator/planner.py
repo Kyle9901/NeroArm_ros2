@@ -22,12 +22,12 @@ SKILL_SCHEMA = {
     "locate_object": {
         "description": "检测物体并计算 3D 基坐标。HSV 优先，失败时调用 VLM。用于非纯色物体（如瓶子、工具）。",
         "args": {"target": "string — 物体描述"},
-        "returns": "{x, y, z, bbox, source, debug_image}",
+        "returns": "{x, y, z, geometry, bbox, source, debug_image}",
     },
     "detect_by_color": {
         "description": "纯 HSV 颜色检测，不调 VLM。仅用于纯色物块：blue/red/green/yellow/purple/orange/cyan。",
         "args": {"target": "string — 颜色名，如 '蓝色方块'、'red block'"},
-        "returns": "{x, y, z, bbox, source, debug_image}",
+        "returns": "{x, y, z, geometry, bbox, source, debug_image}",
     },
     "scan_scene": {
         "description": "扫描桌面所有可见色块，返回带 3D 坐标的列表。",
@@ -36,7 +36,7 @@ SKILL_SCHEMA = {
     },
     "grasp_object": {
         "description": "抓取 (x,y,z) 处的物体。z 是物体表面高度。自动处理 z-offset、夹爪开合、慢速下降。",
-        "args": {"x": "float — base_link X", "y": "float — base_link Y", "z": "float — 物体表面 Z"},
+        "args": {"x": "float — base_link X", "y": "float — base_link Y", "z": "float — 物体表面 Z", "geometry": "object — locate 返回的完整几何信息"},
         "returns": "{holding, pick_x, pick_y, pick_z, gripper_width}",
     },
     "place_object": {
@@ -97,7 +97,7 @@ FEW_SHOT_EXAMPLES = [
             {"name": "prepare", "skill": "prepare", "args": {}},
             {"name": "go_home", "skill": "go_home", "args": {}},
             {"name": "locate", "skill": "detect_by_color", "args": {"target": "蓝色方块"}},
-            {"name": "grasp", "skill": "grasp_object", "args": {"x": "$locate.x", "y": "$locate.y", "z": "$locate.z"}},
+            {"name": "grasp", "skill": "grasp_object", "args": {"x": "$locate.x", "y": "$locate.y", "z": "$locate.z", "geometry": "$locate.geometry"}},
             {"name": "resolve", "skill": "resolve_place", "args": {"place": "右边"}},
             {"name": "place", "skill": "place_object", "args": {"x": "$resolve.x", "y": "$resolve.y", "z": "$resolve.z"}},
         ],
@@ -109,7 +109,7 @@ FEW_SHOT_EXAMPLES = [
             {"name": "go_home", "skill": "go_home", "args": {}},
             {"name": "locate_blue", "skill": "detect_by_color", "args": {"target": "蓝色方块"}},
             {"name": "locate_red", "skill": "detect_by_color", "args": {"target": "红色物块"}},
-            {"name": "grasp_blue", "skill": "grasp_object", "args": {"x": "$locate_blue.x", "y": "$locate_blue.y", "z": "$locate_blue.z"}},
+            {"name": "grasp_blue", "skill": "grasp_object", "args": {"x": "$locate_blue.x", "y": "$locate_blue.y", "z": "$locate_blue.z", "geometry": "$locate_blue.geometry"}},
             {"name": "stack", "skill": "stack_on", "args": {"x": "$locate_red.x", "y": "$locate_red.y", "z": "$locate_red.z", "height": 0.05}},
             {"name": "place", "skill": "place_object", "args": {"x": "$stack.x", "y": "$stack.y", "z": "$stack.z"}},
         ],
@@ -121,7 +121,7 @@ FEW_SHOT_EXAMPLES = [
             {"name": "go_home", "skill": "go_home", "args": {}},
             {"name": "locate_blue", "skill": "detect_by_color", "args": {"target": "蓝色方块"}},
             {"name": "locate_red", "skill": "detect_by_color", "args": {"target": "红色物块"}},
-            {"name": "grasp_blue", "skill": "grasp_object", "args": {"x": "$locate_blue.x", "y": "$locate_blue.y", "z": "$locate_blue.z"}},
+            {"name": "grasp_blue", "skill": "grasp_object", "args": {"x": "$locate_blue.x", "y": "$locate_blue.y", "z": "$locate_blue.z", "geometry": "$locate_blue.geometry"}},
             {"name": "resolve", "skill": "resolve_place", "args": {"place": "右边"}},
             {"name": "place_blue", "skill": "place_object", "args": {"x": "$resolve.x", "y": "$resolve.y", "z": "$resolve.z"}},
         ],

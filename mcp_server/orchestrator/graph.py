@@ -111,8 +111,11 @@ def _make_step_node(step: dict, bridge, vlm, yolo, max_retries: int = _MAX_RETRI
         for attempt in range(max_retries + 1):
             if attempt > 0:
                 print(f"[graph] retry {step_name} ({attempt}/{max_retries})", file=sys.stderr, flush=True)
-                motion.emergency_stop(bridge)
-                motion.go_home(bridge)
+                # Only grasp retries require motion recovery. Health/perception
+                # retries must not create robot goals or clear goal tracking.
+                if is_grasp:
+                    motion.emergency_stop(bridge)
+                    motion.go_home(bridge)
 
             args = _resolve_args(step.get("args", {}), state.get("step_outputs", {}))
             if needs_yolo:
@@ -291,7 +294,8 @@ def build_graph(pipeline: list[dict], bridge, vlm, yolo,
     n = len(pipeline)
 
     for i, step in enumerate(pipeline):
-        retries = 1 if step.get("skill") == "grasp_object" else max_retries
+        skill = step.get("skill")
+        retries = 1 if skill in ("grasp_object", "prepare") else max_retries
         graph.add_node(f"step_{i}", _make_step_node(step, bridge, vlm, yolo, retries))
 
     graph.add_node("done", _make_done_node(user_visible))
@@ -393,7 +397,7 @@ def _fast_route(task: str, bridge) -> list[dict] | None:
         pipeline = [
             {"name": "go_home", "skill": "go_home", "args": {}},
             {"name": "locate", "skill": "locate_object", "args": {"target": target}},
-            {"name": "grasp", "skill": "grasp_object", "args": {"x": "$locate.x", "y": "$locate.y", "z": "$locate.z"}},
+            {"name": "grasp", "skill": "grasp_object", "args": {"x": "$locate.x", "y": "$locate.y", "z": "$locate.z", "geometry": "$locate.geometry"}},
         ]
         if place:
             if place == "原位":
@@ -488,6 +492,13 @@ class GraphExecutor:
         # ── 3. Auto-prepend prepare if missing ──
         if not pipeline or pipeline[0].get("skill") != "prepare":
             pipeline.insert(0, {"name": "prepare", "skill": "prepare", "args": {}})
+
+        # Runtime infrastructure overrides belong specifically to prepare; they
+        # are not object-detection or manipulation arguments.
+        prepare_args = pipeline[0].setdefault("args", {})
+        for key in ("can_port", "calib_name", "octomap_enabled"):
+            if key in params:
+                prepare_args[key] = params[key]
 
         # ── 4. Inject user params into pipeline args ──
         for step in pipeline:

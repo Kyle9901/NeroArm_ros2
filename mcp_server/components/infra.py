@@ -9,8 +9,13 @@ if TYPE_CHECKING:
 
 
 def bringup_nodes(bridge: "RobotBridge", can_port: str = "can0",
-                  calib_name: str = "my_eih_calib_v6") -> ComponentResult:
-    result = bridge.bringup_nodes(can_port=can_port, calib_name=calib_name)
+                  calib_name: str = "my_eih_calib_park",
+                  octomap_enabled: bool = False) -> ComponentResult:
+    result = bridge.bringup_nodes(
+        can_port=can_port,
+        calib_name=calib_name,
+        octomap_enabled=octomap_enabled,
+    )
     if result.get("success") is False:
         return ComponentResult.failure(result.get("hint") or "Bringup failed", **result)
     return ComponentResult.success(**result)

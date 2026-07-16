@@ -1,7 +1,4 @@
 """Prepare/bringup skill."""
-
-import sys
-import time
 from typing import TYPE_CHECKING
 
 from .base import SkillResult
@@ -11,66 +8,64 @@ if TYPE_CHECKING:
     from ..ros_bridge import RobotBridge
 
 
-def _check_tf_frame(bridge: "RobotBridge", frame_id: str, timeout: float = 5.0) -> bool:
-    t0 = time.monotonic()
-    while time.monotonic() - t0 < timeout:
-        try:
-            bridge.node.tf_buffer.can_transform(
-                "base_link", frame_id, bridge.node.get_clock().now())
-            return True
-        except Exception:
-            time.sleep(0.5)
-    return False
-
-
-def _check_duplicate_nodes(bridge: "RobotBridge") -> int:
-    """Return count of each critical node. Returns 0 if none, 1 if clean, >1 if duplicates."""
+def _critical_node_counts(bridge: "RobotBridge") -> dict[str, int]:
+    """Return ROS-graph counts without inspecting or mutating OS processes."""
     try:
-        nodes = bridge.node.get_node_names_and_namespaces()
-        counts = {}
-        for full_name, _ in nodes:
-            base = full_name.split("/")[-1]
-            if base in ("move_group", "agx_arm_ctrl_single_node"):
-                counts[base] = counts.get(base, 0) + 1
-        return max(counts.values()) if counts else 0
+        return bridge.get_node_counts({
+            "move_group", "agx_arm_ctrl_single_node",
+            "handeye_publisher", "dummy_publisher",
+        })
     except Exception:
-        return 0
-
-
-def _kill_extra_nodes(bridge: "RobotBridge") -> None:
-    """Kill duplicate processes, keeping only the newest (highest PID)."""
-    import subprocess
-    for node_name in ("move_group", "agx_arm_ctrl_single_node"):
-        try:
-            result = subprocess.run(
-                ["pgrep", "-f", node_name], capture_output=True, text=True, timeout=5)
-            pids = [int(p) for p in result.stdout.strip().split("\n") if p]
-            if len(pids) <= 1:
-                continue
-            pids.sort()
-            keep = pids[-1]
-            kill = pids[:-1]
-            print(f"[prepare] {node_name}: keeping pid {keep}, killing {kill}",
-                  file=sys.stderr, flush=True)
-            for pid in kill:
-                subprocess.run(["kill", "-9", str(pid)], timeout=5)
-        except Exception:
-            pass
-    time.sleep(1)
-    with bridge._proc_lock:
-        bridge._managed_procs = {}
+        return {}
 
 
 def prepare(bridge: "RobotBridge", can_port: str = "can0",
-            calib_name: str = "my_eih_calib_v6") -> SkillResult:
-    count = _check_duplicate_nodes(bridge)
-    if count > 1:
-        print(f"[prepare] {count} duplicate control nodes detected — keeping newest, killing extras",
-              file=sys.stderr, flush=True)
-        _kill_extra_nodes(bridge)
-    elif count == 0:
-        print("[prepare] no control nodes — starting", file=sys.stderr, flush=True)
-        result = infra.bringup_nodes(bridge, can_port=can_port, calib_name=calib_name)
+            calib_name: str = "my_eih_calib_park",
+            octomap_enabled: bool | None = None) -> SkillResult:
+    if octomap_enabled is None:
+        octomap_enabled = bridge.get_octomap_enabled_on_prepare()
+    else:
+        octomap_enabled = bool(octomap_enabled)
+    counts = _critical_node_counts(bridge)
+    if counts.get("dummy_publisher", 0):
+        return SkillResult.failure(
+            "easy_handeye calibration dummy_publisher is still running. "
+            "Stop handeye_calibrate.launch.py before executing robot tasks.",
+            failed_step="handeye_tf_check",
+            retryable=False,
+            node_counts=counts,
+        )
+    duplicates = {name: count for name, count in counts.items() if count > 1}
+    if duplicates:
+        details = ", ".join(f"{name}={count}" for name, count in sorted(duplicates.items()))
+        return SkillResult.failure(
+            f"Duplicate critical ROS nodes detected: {details}. "
+            "prepare will not choose or kill OS processes automatically. "
+            "Stop the duplicate launch manually, then run prepare again.",
+            failed_step="duplicate_node_check",
+            retryable=False,
+            node_counts=counts,
+        )
+    initial = infra.bringup_status(bridge)
+    initial_endpoints = initial.data.get("endpoints", {}) if initial.ok else {}
+    required_endpoints = [
+        "move_action", "camera_color", "handeye_publisher",
+        "planning_scene_apply", "planning_scene_get", "tf",
+    ]
+    if octomap_enabled:
+        required_endpoints.extend(["octomap_cloud", "octomap_control"])
+    launch_required = not all(
+        initial_endpoints.get(name) for name in required_endpoints
+    )
+    started = False
+    if launch_required:
+        result = infra.bringup_nodes(
+            bridge,
+            can_port=can_port,
+            calib_name=calib_name,
+            octomap_enabled=octomap_enabled,
+        )
+        started = True
         if not result.ok:
             return SkillResult.failure(
                 result.error or "bringup failed",
@@ -79,44 +74,33 @@ def prepare(bridge: "RobotBridge", can_port: str = "can0",
                 **result.data,
             )
 
-    status = infra.bringup_status(bridge)
-    endpoints = status.data.get("endpoints", {}) if status.ok else {}
-
-    if endpoints.get("move_action") and endpoints.get("camera_color") and endpoints.get("tf"):
-        frame = perception.capture_image(bridge, timeout=3.0)
-        if frame.ok:
-            if _check_tf_frame(bridge, "camera_color_optical_frame", timeout=3.0):
-                return SkillResult.success(already_ready=True, **status.data)
-            print("[prepare] TF frame missing — restarting calib", file=sys.stderr, flush=True)
-        else:
-            print("[prepare] camera topic exists but no image — restarting camera", file=sys.stderr, flush=True)
-        result = infra.bringup_nodes(bridge, can_port=can_port, calib_name=calib_name)
-    else:
-        result = infra.bringup_nodes(bridge, can_port=can_port, calib_name=calib_name)
-
-    if not result.ok:
+    # Enforce the configured state even when the cloud gate was already running.
+    # Disabling also clears any voxels retained by MoveIt from an earlier run.
+    octomap = bridge.set_octomap_enabled(octomap_enabled)
+    if not octomap.get("success"):
         return SkillResult.failure(
-            result.error or "bringup failed",
-            failed_step="bringup_nodes",
+            octomap.get("error") or "Failed to configure OctoMap",
+            failed_step="octomap_configuration",
             retryable=True,
-            **result.data,
+            octomap=octomap,
         )
 
     frame = perception.capture_image(bridge, timeout=5.0)
-    if not frame.ok:
+    health = bridge.health_status()
+    if not health["ready"]:
+        failures = ", ".join(health["failures"])
+        camera_reason = health.get("camera", {}).get("last_rejection")
+        detail = f"; camera_last_rejection={camera_reason}" if camera_reason else ""
         return SkillResult.failure(
-            "Camera started but no image received. Check camera hardware.",
-            failed_step="camera_check",
+            f"Robot health check failed: {failures}{detail}",
+            failed_step="health_check",
             retryable=True,
-            **result.data,
+            health=health,
+            capture_error=None if frame.ok else frame.error,
         )
 
-    if not _check_tf_frame(bridge, "camera_color_optical_frame", timeout=8.0):
-        return SkillResult.failure(
-            "TF frame camera_color_optical_frame not found. Check handeye calibration.",
-            failed_step="tf_check",
-            retryable=True,
-            **result.data,
-        )
-
-    return SkillResult.success(already_ready=False, **result.data)
+    return SkillResult.success(
+        already_ready=not started,
+        health=health,
+        octomap=octomap,
+    )

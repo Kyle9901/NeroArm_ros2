@@ -12,6 +12,7 @@ Architecture decisions (see yolo-integration-plan.md):
 
 import os
 import sys
+import threading
 from typing import Optional
 
 import cv2
@@ -420,3 +421,46 @@ class YoloDetector:
     def is_loaded(self) -> bool:
         """Check if model is loaded and ready."""
         return hasattr(self, "model") and self.model is not None
+
+
+class LazyYoloDetector:
+    """YOLO-compatible proxy which loads and warms the model on first inference."""
+
+    def __init__(self, model_path=None, confidence=None, device=None):
+        self._options = (model_path, confidence, device)
+        self._confidence = confidence
+        self._detector = None
+        self._lock = threading.Lock()
+
+    def _get(self) -> YoloDetector:
+        if self._detector is None:
+            with self._lock:
+                if self._detector is None:
+                    model_path, _initial_confidence, device = self._options
+                    # Runtime configuration may update confidence before the
+                    # first inference; preserve that value across lazy load.
+                    self._detector = YoloDetector(model_path, self._confidence, device)
+        return self._detector
+
+    @property
+    def confidence(self) -> float:
+        if self._detector is not None:
+            return self._detector.confidence
+        if self._confidence is not None:
+            return self._confidence
+        return float(os.environ.get("YOLO_CONFIDENCE", "0.35"))
+
+    @confidence.setter
+    def confidence(self, value: float):
+        self._confidence = value
+        if self._detector is not None:
+            self._detector.confidence = value
+
+    def detect(self, *args, **kwargs):
+        return self._get().detect(*args, **kwargs)
+
+    def detect_all(self, *args, **kwargs):
+        return self._get().detect_all(*args, **kwargs)
+
+    def is_loaded(self) -> bool:
+        return self._detector is not None and self._detector.is_loaded()

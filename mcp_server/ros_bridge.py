@@ -26,10 +26,12 @@ from .ros import (
     BringupManager,
     CameraStream,
     JointStateMonitor,
+    OctomapControl,
     PlanningSceneService,
     TransformService,
 )
 from .ros.motion import MotionControllerMixin
+from .config import load_robot_parameters
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════
 class RobotBridgeNode(Node, MotionControllerMixin):
@@ -40,7 +42,7 @@ class RobotBridgeNode(Node, MotionControllerMixin):
 
         self.cb_group = ReentrantCallbackGroup()
 
-        # ── parameters (hard-wired defaults, override via ROS params if needed) ──
+        # YAML values are declaration defaults; ROS parameter overrides still win.
         self._declare_params()
 
         # ── state ──
@@ -61,80 +63,21 @@ class RobotBridgeNode(Node, MotionControllerMixin):
         # ── action / service clients ──
         self._init_moveit_clients()
         self.scene = PlanningSceneService(self, self.cb_group)
+        self.octomap = OctomapControl(self, self.cb_group)
 
         self.get_logger().info("RobotBridgeNode ready")
 
     # ─────────────────────────── parameters ───────────────────────
     def _declare_params(self):
-        p = self.declare_parameter
-        # ── 机械臂 / 规划 ──
-        p("planning_group", "arm")              # MoveIt 规划组名
-        p("tcp_link", "tcp_link")               # 末端执行器连杆名
-        p("base_frame", "base_link")            # 机器人基坐标系
-        p("grasp_quat", [0.503, 0.497, -0.499, 0.501])  # 实测抓取姿态四元数 (x,y,z,w)
-        # ── 工作空间 ──
-        p("workspace_x_min", -0.55)             # 工作空间 X 下限 (m)
-        p("workspace_x_max", 0.25)              # 工作空间 X 上限 (m)
-        p("workspace_y_min", -0.55)             # 工作空间 Y 下限 (m)
-        p("workspace_y_max", 0.2)               # 工作空间 Y 上限 (m)
-        # ── 抓取几何 ──
-        p("approach_height", 0.26)              # 预抓位高度: 物体表面上方距离 (m)
-        p("safe_height", 0.40)                  # 安全抬起高度 (m)
-        p("grasp_depth", 0.03)                  # 指尖从物体表面向下探入的深度 (m), 旧语义: 法兰从预抓位下降距离
-        p("flange_to_tip", 0.175)               # 法兰 → 夹爪指尖距离, 固定硬件参数 (m)
-        p("fingertip_overlap", 0.02)            # 指尖探入物块表面的深度 (m)
-        # ── 放置位置 ──
-        p("place_x", -0.40)                     # 默认放置 X (m)
-        p("place_y", -0.25)                     # 默认放置 Y (m)
-        p("place_z", 0.20)                      # 默认放置 Z (m)
-        # ── 夹爪 ──
-        p("gripper_open_width", 0.10)           # 夹爪张开宽度 (m)
-        p("gripper_close_width", 0.02)          # 夹爪闭合宽度 (m)
-        # ── 规划 ──
-        p("planning_time", 10.0)                # 单次规划超时 (s), 首次规划需构建碰撞结构
-        p("num_planning_attempts", 3)           # 最大规划尝试次数
-        # ── 运动速度 (0-1, 1=全速) ──
-        p("velocity_scaling", 0.5)             # 普通运动速度倍率 (approach / lift / home)
-        p("accel_scaling", 0.3)                # 普通运动加速度倍率
-        p("descent_velocity_scaling", 0.2)     # 笛卡尔下降速度倍率 (慢速精确)
-        p("descent_accel_scaling", 0.05)        # 笛卡尔下降加速度倍率
-        # ── 笛卡尔路径 ──
-        p("cartesian_eef_step", 0.005)          # 笛卡尔路径步长 (m)
-        p("cartesian_min_fraction", 0.2)        # 笛卡尔路径最低通过率 (0-1)
-        p("cartesian_jump_threshold", 2.0)      # 笛卡尔路径跳跃阈值, 0=禁用
-        # ── 位姿容差 ──
-        p("pos_tolerance", 0.01)                # 位置容差 (m)
-        p("ori_tolerance", 0.1)                 # 姿态容差 (rad)
-        # ── Home 位置 ──
-        p("home_joints_deg", [0.0, -20.0, 0.0, 80.0, 0.0, 0.0, 80.0])  # 7 关节 home 角度 (度)
-        # ── 桌面碰撞对象 ──
-        p("desk_z_surface", -0.001)             # 桌面在 base_link 中的 Z 坐标 (m)
-        p("desk_size", [2.0, 2.0, 0.02])        # 桌面碰撞体: 长, 宽, 厚度 (m)
+        config_path, parameters = load_robot_parameters()
+        for name, default in parameters.items():
+            self.declare_parameter(name, default)
+        self.get_logger().info(f"Loaded robot config: {config_path}")
 
     def add_desk_collision(self, timeout=5.0) -> bool:
         """Add desk surface as collision object to the planning scene.
         Uses ROS params desk_z_surface and desk_size."""
         return self.scene.add_desk(timeout)
-
-    def add_target_collision(self, x: float, y: float, z: float,
-                             object_id: str = "target_object",
-                             size: tuple[float, float, float] = (0.06, 0.06, 0.08),
-                             shape: str = "BOX",
-                             timeout: float = 5.0) -> bool:
-        """Add target object as collision object and allow gripper to touch it.
-
-        Args:
-            x, y, z: Object center in base_link frame.
-            object_id: Unique name for this collision object.
-            size: (x, y, z) dimensions in meters. Default 6x6x8cm for blocks/cups.
-            shape: 'BOX' or 'CYLINDER'.
-        """
-        return self.scene.add_target(x, y, z, object_id, size, shape, timeout)
-
-    def remove_target_collision(self, object_id: str = "target_object",
-                                timeout: float = 5.0) -> bool:
-        """Remove target collision object and clear its ACM entry."""
-        return self.scene.remove_target(object_id, timeout)
 
     def get_latest_images(self, timeout=2.0):
         """Wait for fresh color+depth pair, return (color_bgr, depth_16uc1)."""
@@ -147,13 +90,21 @@ class RobotBridgeNode(Node, MotionControllerMixin):
     def compute_3d(self, u: int, v: int, depth_img, margin_px: int = 2) -> dict | None:
         return self.camera.compute_3d(u, v, depth_img, margin_px)
 
-    def transform_to_base(self, x_c: float, y_c: float, z_c: float, timeout=1.0) -> dict | None:
+    def transform_to_base(
+        self, x_c: float, y_c: float, z_c: float, timeout=1.0,
+        *, stamp=None, source_frame: str = "camera_color_optical_frame",
+    ) -> dict | None:
         """
         TF2 transform from camera_color_optical_frame → base_link.
 
         Returns {"x", "y", "z"} in base_link frame.
         """
-        return self.transforms.transform_point(x_c, y_c, z_c, timeout=timeout)
+        return self.transforms.transform_point(
+            x_c, y_c, z_c,
+            source_frame=source_frame,
+            stamp=stamp,
+            timeout=timeout,
+        )
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════
 #   Thread-safe wrapper — public API for MCP tools
@@ -194,8 +145,11 @@ class RobotBridge:
         time.sleep(1.0)  # give spin thread a moment to start
         if wait_servers:
             self._node.wait_servers()
-        # Add desk collision object (best-effort, won't fail if service not ready)
-        self._node.add_desk_collision()
+        # Keep MCP startup equivalent to manual MoveIt operation by default.
+        # The desk can still be enabled explicitly without changing the numeric
+        # desk-height safety clamp used by grasping.
+        if bool(self._node._get_param("desk_collision_enabled")):
+            self._node.add_desk_collision()
         self._ready.set()
 
     def _spin_loop(self):
@@ -211,6 +165,9 @@ class RobotBridge:
 
     def shutdown(self):
         self._shutdown_flag = True
+        # Only processes launched by this bridge are owned and stopped here.
+        # Externally launched ROS nodes are intentionally left untouched.
+        self.bringup.stop_all()
         if self._executor is not None:
             self._executor.wake()
         if self._spin_thread is not None:
@@ -236,11 +193,26 @@ class RobotBridge:
     def get_approach_height(self) -> float:
         return self.node._get_param("approach_height")
 
-    def get_grasp_depth(self) -> float:
-        return self.node._get_param("grasp_depth")
+    def get_fingertip_depth(self) -> float:
+        """Configured distance from the detected object surface to the physical fingertip."""
+        return self.node._get_param("fingertip_depth")
+
+    def get_color_block_height(self) -> float:
+        return self.node._get_param("color_block_height")
 
     def get_safe_height(self) -> float:
         return self.node._get_param("safe_height")
+
+    def get_desk_surface_z(self) -> float:
+        return float(self.node._get_param("desk_z_surface"))
+
+    def get_workspace_bounds(self) -> dict[str, float]:
+        return {
+            "x_min": float(self.node._get_param("workspace_x_min")),
+            "x_max": float(self.node._get_param("workspace_x_max")),
+            "y_min": float(self.node._get_param("workspace_y_min")),
+            "y_max": float(self.node._get_param("workspace_y_max")),
+        }
 
     def get_place_pose(self) -> dict:
         n = self.node
@@ -256,11 +228,11 @@ class RobotBridge:
     def get_flange_to_tip(self) -> float:
         return self.node._get_param("flange_to_tip")
 
-    def get_fingertip_overlap(self) -> float:
-        return self.node._get_param("fingertip_overlap")
-
     def get_velocity_scaling(self) -> float:
         return self.node._get_param("velocity_scaling")
+
+    def get_octomap_enabled_on_prepare(self) -> bool:
+        return bool(self.node._get_param("octomap_enabled_on_prepare"))
 
     def get_descent_velocity_scaling(self) -> float:
         return self.node._get_param("descent_velocity_scaling")
@@ -270,6 +242,27 @@ class RobotBridge:
 
     def emergency_stop(self) -> tuple[bool, str]:
         return self.node.emergency_stop()
+
+    def get_joint_state(self) -> dict:
+        return self.node.get_joint_state()
+
+    def can_transform(
+        self, source_frame: str, target_frame: str | None = None,
+        timeout: float = 1.0,
+    ) -> bool:
+        return self.node.transforms.can_transform(
+            source_frame,
+            target_frame or self.get_base_frame(),
+            timeout,
+        )
+
+    def get_node_counts(self, names: set[str]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for node_name, _namespace in self.node.get_node_names_and_namespaces():
+            base = node_name.split("/")[-1]
+            if base in names:
+                counts[base] = counts.get(base, 0) + 1
+        return counts
 
     # ── holding state ──
     def get_holding(self) -> bool:
@@ -332,7 +325,9 @@ class RobotBridge:
             f"- holding: {holding}",
             f"- grasped_object: {held_desc}",
             f"- at_home: {self.is_at_home()}",
-            f"- nodes_ready: move_action={ready.get('move_action')}, camera={ready.get('camera_color')}, tf={ready.get('tf')}",
+            f"- nodes_ready: move_action={ready.get('move_action')}, "
+            f"camera={ready.get('camera_color')}, octomap={ready.get('octomap_cloud')}, "
+            f"tf={ready.get('tf')}",
         ]
         recent = ctx.get("recent_actions") or []
         if recent:
@@ -341,8 +336,90 @@ class RobotBridge:
 
     # ── bringup: launch management ──
 
-    def bringup_nodes(self, can_port: str = "can0", calib_name: str = "my_eih_calib_v6") -> dict:
-        return self.bringup.start(can_port=can_port, calib_name=calib_name)
+    def bringup_nodes(self, can_port: str = "can0", calib_name: str = "my_eih_calib_park",
+                      octomap_enabled: bool = False) -> dict:
+        return self.bringup.start(
+            can_port=can_port,
+            calib_name=calib_name,
+            octomap_enabled=octomap_enabled,
+        )
 
     def bringup_status(self) -> dict:
         return self.bringup.status()
+
+    def health_status(self) -> dict:
+        status = self.bringup.status()
+        endpoints = status.get("endpoints", {})
+        topics = status.get("topics", {})
+        camera = self.node.camera.health_status()
+        registered = topics.get("/camera/depth_registered/points", {})
+        filtered = topics.get("/filtered_cloud", {})
+        octomap = topics.get("/octomap_cloud", {})
+        try:
+            tf_ready = self.can_transform("camera_color_optical_frame", timeout=1.0)
+        except Exception:
+            tf_ready = False
+
+        octomap_enabled = self.get_octomap_enabled_on_prepare()
+        checks = {
+            "can_up": bool(status.get("can", {}).get("up")),
+            "move_action": bool(endpoints.get("move_action")),
+            "planning_scene": bool(
+                endpoints.get("planning_scene_apply")
+                and endpoints.get("planning_scene_get")
+            ),
+            "rgbd_pair_fresh": bool(camera.get("pair_fresh")),
+            "depth_registered": bool(camera.get("registered_shapes_match")),
+            "camera_info": bool(camera.get("camera_info_received")),
+            "handeye_publisher": bool(endpoints.get("handeye_publisher")),
+            "camera_to_base_tf": tf_ready,
+            "pointcloud_pipeline": bool(
+                filtered.get("publishers", 0) > 0
+                or octomap.get("publishers", 0) > 0
+            ),
+            "octomap_cloud_publisher": octomap.get("publishers", 0) > 0,
+            "move_group_octomap_subscriber": "move_group" in octomap.get("subscriber_nodes", []),
+            "octomap_control": bool(endpoints.get("octomap_control")),
+        }
+        required = {
+            "can_up", "move_action", "planning_scene", "rgbd_pair_fresh",
+            "depth_registered", "camera_info", "handeye_publisher",
+            "camera_to_base_tf",
+        }
+        if octomap_enabled:
+            required.update({
+                "pointcloud_pipeline", "octomap_cloud_publisher",
+                "move_group_octomap_subscriber", "octomap_control",
+            })
+        failures = [name for name in required if not checks[name]]
+        warnings = []
+        if registered.get("publishers", 0) == 0:
+            warnings.append("registered_cloud_publisher_not_visible")
+        return {
+            "ready": not failures,
+            "failures": failures,
+            "warnings": warnings,
+            "checks": checks,
+            "octomap_required": octomap_enabled,
+            "observations": {
+                "registered_cloud_publishers": registered.get("publishers", 0),
+                "filtered_cloud_publishers": filtered.get("publishers", 0),
+                "octomap_cloud_publishers": octomap.get("publishers", 0),
+            },
+            "camera": camera,
+            "topics": topics,
+            "endpoints": endpoints,
+            "processes": status.get("processes", {}),
+            "can": status.get("can", {}),
+        }
+
+    def set_octomap_enabled(self, enabled: bool) -> dict:
+        result = self.node.octomap.set_enabled(enabled)
+        if enabled and not result.get("success"):
+            started = self.bringup.start_pointcloud_filter(enabled=True)
+            if not started.get("success"):
+                result["bringup"] = started
+                return result
+            result = self.node.octomap.set_enabled(True)
+            result["bringup"] = started
+        return result

@@ -17,24 +17,19 @@ if TYPE_CHECKING:
 
 def get_status(bridge: "RobotBridge") -> dict:
     """Return the hardware and grasp-geometry status exposed by MCP."""
-    js = bridge.node.get_joint_state()
+    js = bridge.get_joint_state()
     return {
         "success": True,
         **js,
         "holding": bridge.get_holding(),
-        "workspace": {
-            "x_min": bridge.node._workspace_x_min,
-            "x_max": bridge.node._workspace_x_max,
-            "y_min": bridge.node._workspace_y_min,
-            "y_max": bridge.node._workspace_y_max,
-        },
+        "workspace": bridge.get_workspace_bounds(),
         "safe_height": bridge.get_safe_height(),
-        "desk_surface_z": bridge.node._get_param("desk_z_surface"),
+        "desk_surface_z": bridge.get_desk_surface_z(),
         "grasp_geometry": {
             "flange_to_tip": bridge.get_flange_to_tip(),
-            "fingertip_overlap": bridge.get_fingertip_overlap(),
-            "grasp_depth": bridge.get_grasp_depth(),
+            "fingertip_depth": bridge.get_fingertip_depth(),
         },
+        "health": bridge.health_status(),
     }
 
 
@@ -42,6 +37,11 @@ def stop(bridge: "RobotBridge") -> dict:
     """Cancel tracked robot motion goals."""
     ok, message = bridge.emergency_stop()
     return {"success": ok, "message": message}
+
+
+def configure_octomap(bridge: "RobotBridge", enabled: bool) -> dict:
+    """Enable live OctoMap updates or stop updates and clear existing voxels."""
+    return bridge.set_octomap_enabled(enabled)
 
 
 def configure_runtime(

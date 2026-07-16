@@ -23,8 +23,7 @@ def _fail(error: str, step: str, *, recovered: bool = False,
 
 def grasp_object(bridge: "RobotBridge", x: float, y: float, z: float,
                  quat: list[float] | None = None,
-                 object_id: str = "target_object",
-                 object_size: tuple[float, float, float] = (0.06, 0.06, 0.08)) -> SkillResult:
+                 geometry: dict | None = None) -> SkillResult:
     geo = GraspGeometry.from_bridge(bridge)
     quat = quat or bridge.get_grasp_quat()
 
@@ -34,38 +33,22 @@ def grasp_object(bridge: "RobotBridge", x: float, y: float, z: float,
 
     print(f"[grasp] target: x={x:.4f}, y={y:.4f}, z={z:.4f}, "
           f"approach_z={z + geo.approach_height:.4f}, grasp_z={geo.grasp_z(z):.4f} "
-          f"(fingertip={z - geo.grasp_depth:.4f})", flush=True)
+          f"(fingertip_z={geo.fingertip_z(z):.4f}, "
+          f"fingertip_depth={geo.fingertip_depth:.3f})", flush=True)
 
     # Safety: clamp fingertip to desk surface (don't go below the desk)
-    desk_z = bridge.node._get_param("desk_z_surface")
-    fingertip_z = z - geo.grasp_depth
+    desk_z = (
+        float(geometry["local_desk_z"])
+        if geometry and geometry.get("local_desk_z") is not None
+        else bridge.get_desk_surface_z()
+    )
+    fingertip_z = geo.fingertip_z(z)
     if fingertip_z < desk_z:
         clamped_depth = z - desk_z
         print(f"[grasp] WARNING: fingertip {fingertip_z:.4f} below desk {desk_z:.4f}, "
-              f"clamping grasp_depth {geo.grasp_depth:.3f}→{clamped_depth:.3f}", flush=True)
-        geo = GraspGeometry.from_bridge(bridge)
-        geo = GraspGeometry(
-            flange_to_tip=geo.flange_to_tip,
-            grasp_depth=clamped_depth,
-            approach_height=geo.approach_height,
-            safe_height=geo.safe_height,
-            gripper_open=geo.gripper_open,
-            gripper_close=geo.gripper_close,
-            hold_margin=geo.hold_margin,
-            descent_vel=geo.descent_vel,
-            descent_accel=geo.descent_accel,
-        )
-
-    # 清理上一次残留的 CollisionObject 和 ACM
-    bridge.node.remove_target_collision(object_id)
-
-    # 注册目标物体 → CollisionObject 会"吃掉" Octomap 体素，ACM 幽灵化
-    # 宽度: 检测宽度每边 +1cm, 高度: 表面向上 0.5cm + 向下 10cm = 10.5cm
-    box_w = object_size[0] + 0.03  # 每边 +1.5cm
-    box_h = 0.13                    # 0.5cm 上 + 10cm 下 + 2.5cm 额外
-    bridge.node.add_target_collision(
-        x, y, z - object_size[2] / 2.0,  # 中心在物体几何中心
-        object_id=object_id, size=(box_w, box_w, box_h))
+              f"clamping fingertip_depth {geo.fingertip_depth:.3f}→{clamped_depth:.3f}",
+              flush=True)
+        geo = geo.with_fingertip_depth(clamped_depth)
 
     result = motion.control_gripper(bridge, geo.gripper_open, duration=2.0)
     if not result.ok:
@@ -107,7 +90,6 @@ def grasp_object(bridge: "RobotBridge", x: float, y: float, z: float,
         )
 
     bridge.set_holding(holding)
-    bridge.node.remove_target_collision(object_id)
     return SkillResult.success(
         holding=holding,
         state="holding" if holding else "empty",
@@ -115,6 +97,7 @@ def grasp_object(bridge: "RobotBridge", x: float, y: float, z: float,
         pick_x=x,
         pick_y=y,
         pick_z=z,
+        geometry=geometry,
     )
 
 

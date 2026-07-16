@@ -1,6 +1,6 @@
 """Shared types and geometry helpers for skills."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, TYPE_CHECKING
 
 from ..models import OperationResult
@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 @dataclass(frozen=True)
 class GraspGeometry:
     flange_to_tip: float
-    grasp_depth: float
+    fingertip_depth: float
     approach_height: float
     safe_height: float
     gripper_open: float
@@ -25,7 +25,7 @@ class GraspGeometry:
     def from_bridge(cls, bridge: "RobotBridge", hold_margin: float = 0.005) -> "GraspGeometry":
         return cls(
             flange_to_tip=bridge.get_flange_to_tip(),
-            grasp_depth=bridge.get_grasp_depth(),
+            fingertip_depth=bridge.get_fingertip_depth(),
             approach_height=bridge.get_approach_height(),
             safe_height=bridge.get_safe_height(),
             gripper_open=bridge.get_gripper_open_width(),
@@ -38,9 +38,16 @@ class GraspGeometry:
     def is_holding(self, width: float | None) -> bool:
         return width is not None and width > self.gripper_close + self.hold_margin
 
+    def fingertip_z(self, surface_z: float) -> float:
+        """Physical fingertip Z after descending below the detected surface."""
+        return surface_z - self.fingertip_depth
+
     def grasp_z(self, surface_z: float) -> float:
-        """TCP flange Z for grasping: fingertip = surface_z - grasp_depth."""
-        return surface_z + self.flange_to_tip - self.grasp_depth
+        """TCP/flange Z that places the physical fingertip at ``fingertip_z``."""
+        return self.fingertip_z(surface_z) + self.flange_to_tip
+
+    def with_fingertip_depth(self, depth: float) -> "GraspGeometry":
+        return replace(self, fingertip_depth=float(depth))
 
 
 @dataclass
