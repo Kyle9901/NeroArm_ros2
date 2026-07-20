@@ -85,6 +85,16 @@ def prepare(bridge: "RobotBridge", can_port: str = "can0",
             octomap=octomap,
         )
 
+    # The bridge may start before MoveIt's planning-scene service.  Add the
+    # single permitted world object here as well, after bringup, and treat a
+    # failure as a safety error.  No target collision box or OctoMap is needed.
+    if bridge.get_desk_collision_enabled() and not bridge.node.add_desk_collision():
+        return SkillResult.failure(
+            "Failed to add the configured desk collision BOX",
+            failed_step="desk_collision",
+            retryable=True,
+        )
+
     frame = perception.capture_image(bridge, timeout=5.0)
     health = bridge.health_status()
     if not health["ready"]:

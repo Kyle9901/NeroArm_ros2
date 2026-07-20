@@ -7,6 +7,7 @@ OpenClaw only sees the high-level tools defined in this module.
 """
 
 import asyncio
+from concurrent.futures import Executor, ThreadPoolExecutor
 import os
 import sys
 import traceback
@@ -80,7 +81,8 @@ TOOL_DEFINITIONS = [
         "name": "arm_prepare",
         "description": (
             "Prepare the robot system for task execution. Starts or checks arm, camera, hand-eye TF, "
-            "point-cloud filter, and OctoMap gate nodes. "
+            "MoveIt planning scene, and the configured desk collision box. "
+            "Point-cloud filtering and OctoMap remain optional and disabled by default. "
             "Call this once at the start of a session before arm_execute_task. "
             "If everything is already ready, it returns immediately."
         ),
@@ -120,7 +122,12 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "arm_stop",
-        "description": "Emergency stop — cancel current motion goals immediately.",
+        "description": (
+            "Cooperatively block subsequent skills, retries, plans, trajectories, "
+            "and gripper commands, then clear tracked goals. Due to a MoveIt Jazzy "
+            "cancellation crash workaround, this does not cancel a trajectory already "
+            "accepted by the controller and is not an emergency stop."
+        ),
         "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
     {
@@ -175,7 +182,6 @@ def _call_tool(name: str, args: dict, bridge: RobotBridge, vlm: VlmClient,
         if name == "arm_configure_octomap":
             return api_services.configure_octomap(bridge, args["enabled"])
         if name == "arm_stop":
-            bridge.reset_task_context()
             return api_services.stop(bridge)
         if name == "arm_reset_context":
             bridge.reset_task_context()
@@ -268,6 +274,53 @@ class AppContext:
 _app: AppContext | None = None
 
 
+async def _dispatch_tool_async(
+    name: str,
+    arguments: dict[str, Any],
+    app: AppContext,
+    task_lock: asyncio.Lock,
+    task_executor: Executor,
+) -> dict:
+    """Dispatch MCP tools while preserving single-task robot semantics."""
+    if name == "arm_execute_task":
+        if task_lock.locked():
+            return {
+                "status": "failed",
+                "error": "Another robot task is already running",
+            }
+        # Task execution contains blocking ROS waits.  Keep it off the MCP
+        # event loop so arm_stop can set the cooperative stop flag while a
+        # task is in progress.
+        async with task_lock:
+            clear_stop = getattr(app.bridge, "clear_task_stop", None)
+            if callable(clear_stop):
+                # Clear before queueing the worker. A stop arriving after this
+                # point must remain visible to the active task.
+                clear_stop()
+            return await asyncio.get_running_loop().run_in_executor(
+                task_executor,
+                _call_tool,
+                name, arguments, app.bridge, app.vlm, app.yolo,
+                app.executor, app.sessions,
+            )
+    if task_lock.locked() and name in {
+        "arm_prepare",
+        "arm_configure_octomap",
+        "arm_reset_context",
+    }:
+        return {
+            "success": False,
+            "error": (
+                f"{name} is unavailable while a robot task is running; "
+                "use arm_stop to prevent subsequent task steps"
+            ),
+        }
+    return _call_tool(
+        name, arguments, app.bridge, app.vlm, app.yolo,
+        app.executor, app.sessions,
+    )
+
+
 async def _async_main():
     global _app
     print("[robot-arm] Starting MCP server (orchestration mode)...", file=sys.stderr)
@@ -290,6 +343,11 @@ async def _async_main():
     )
 
     server = Server("robot-arm")
+    task_lock = asyncio.Lock()
+    task_executor = ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="robot-task",
+    )
 
     @server.list_tools()
     async def list_tools() -> list[Tool]:
@@ -297,13 +355,19 @@ async def _async_main():
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict[str, Any]) -> dict:
-        return _call_tool(
-            name, arguments, _app.bridge, _app.vlm, _app.yolo,
-            _app.executor, _app.sessions,
+        return await _dispatch_tool_async(
+            name, arguments, _app, task_lock, task_executor
         )
 
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            await server.run(
+                read_stream,
+                write_stream,
+                server.create_initialization_options(),
+            )
+    finally:
+        task_executor.shutdown(wait=True, cancel_futures=True)
 
 
 def main():

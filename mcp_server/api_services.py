@@ -26,15 +26,37 @@ def get_status(bridge: "RobotBridge") -> dict:
         "safe_height": bridge.get_safe_height(),
         "desk_surface_z": bridge.get_desk_surface_z(),
         "grasp_geometry": {
-            "flange_to_tip": bridge.get_flange_to_tip(),
+            "configured_tcp_offset": bridge.get_tcp_offset(),
             "fingertip_depth": bridge.get_fingertip_depth(),
+            "candidate_tilts_deg": bridge.get_grasp_tilt_angles_deg(),
+            "cylinder_candidate_tilts_deg": (
+                bridge.get_cylinder_tilt_angles_deg()
+            ),
+            "cylinder_side_grasp_height_ratio": (
+                bridge.get_cylinder_side_grasp_height_ratio()
+            ),
+            "cylinder_diameter_range_m": [
+                bridge.get_cylinder_min_diameter_m(),
+                bridge.get_cylinder_max_diameter_m(),
+            ],
+            "cylinder_length_range_m": [
+                bridge.get_cylinder_min_length_m(),
+                bridge.get_cylinder_max_length_m(),
+            ],
+            "pregrasp_distance": bridge.get_grasp_pregrasp_distance(),
+            "retreat_distance": bridge.get_grasp_retreat_distance(),
+            "reverse_branch_tolerance_rad": (
+                bridge.get_reverse_branch_tolerance_rad()
+            ),
         },
+        "observation_joints_deg": bridge.get_observation_joints_deg(),
+        "carry_joints_deg": bridge.get_carry_joints_deg(),
         "health": bridge.health_status(),
     }
 
 
 def stop(bridge: "RobotBridge") -> dict:
-    """Cancel tracked robot motion goals."""
+    """Request a cooperative task stop and clear diagnostic goal tracking."""
     ok, message = bridge.emergency_stop()
     return {"success": ok, "message": message}
 

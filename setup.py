@@ -9,7 +9,7 @@ package_name = "vision_grasp"
 
 setup(
     name=package_name,
-    version="0.0.1",
+    version="0.2.1",
     packages=find_packages(exclude=["test", "test.*"]),
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
@@ -20,7 +20,17 @@ setup(
             glob(os.path.join("launch", "*.launch.py")),
         ),
     ],
-    install_requires=["setuptools", "opencv-python", "numpy", "requests", "PyYAML"],
+    install_requires=[
+        "setuptools",
+        "opencv-python",
+        "numpy",
+        "requests",
+        "PyYAML",
+        "langgraph>=1.2.0",
+        "langchain-core>=1.4.0",
+        "mcp>=1.27.0",
+        "ultralytics>=8.3.0",
+    ],
     zip_safe=False,
     maintainer="Alkaid",
     maintainer_email="alkaid@example.com",

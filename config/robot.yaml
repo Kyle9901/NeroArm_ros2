@@ -3,16 +3,40 @@ robot_bridge_node:
     planning_group: arm
     tcp_link: tcp_link
     base_frame: base_link
-    grasp_quat: [0.503, 0.497, -0.499, 0.501]
+    tcp_offset: [0.1733, 0.0, -0.0235, -1.5708, 0.0, -1.5708]
+    grasp_quat: [0.00199997, 0.99999001, 0.00000184, 0.00399813]
     workspace_x_min: -0.55
     workspace_x_max: 0.25
     workspace_y_min: -0.55
     workspace_y_max: 0.20
-    approach_height: 0.26
-    safe_height: 0.40
+    approach_height: 0.0867
+    safe_height: 0.2267
     fingertip_depth: 0.04
-    flange_to_tip: 0.1733
-    color_block_height: 0.05
+    block_depth_frames: 5
+    block_depth_max_spread: 0.012
+    block_xy_max_spread: 0.015
+    block_yaw_max_spread_deg: 12.0
+    cylinder_depth_frames: 5
+    cylinder_depth_max_spread: 0.015
+    cylinder_position_max_spread: 0.015
+    cylinder_axis_max_spread_deg: 12.0
+    cylinder_lying_axis_max_deviation_deg: 30.0
+    cylinder_min_diameter_m: 0.035
+    cylinder_max_diameter_m: 0.085
+    cylinder_min_length_m: 0.08
+    cylinder_max_length_m: 0.30
+    cylinder_side_grasp_height_ratio: 0.45
+    cylinder_tilt_angles_deg: [0, 60, 90]
+    desk_measurement_max_error: 0.05
+    grasp_tilt_angles_deg: [0, 30, 60]
+    grasp_pregrasp_distance: 0.08
+    grasp_retreat_distance: 0.08
+    grasp_candidate_timeout: 8.0
+    grasp_full_plan_candidates: 2
+    joint7_soft_limit_deg: 85.0
+    joint7_min_margin_deg: 15.0
+    planned_start_tolerance_rad: 0.02
+    reverse_branch_tolerance_rad: 0.10
     place_x: -0.40
     place_y: -0.25
     place_z: 0.20
@@ -21,7 +45,7 @@ robot_bridge_node:
     planning_time: 5.0
     num_planning_attempts: 2
     octomap_enabled_on_prepare: false
-    desk_collision_enabled: false
+    desk_collision_enabled: true
     velocity_scaling: 0.5
     accel_scaling: 0.3
     descent_velocity_scaling: 0.2
@@ -31,6 +55,7 @@ robot_bridge_node:
     cartesian_jump_threshold: 2.0
     pos_tolerance: 0.01
     ori_tolerance: 0.10
-    home_joints_deg: [0.0, -20.0, 0.0, 80.0, 0.0, 0.0, 80.0]
+    observation_joints_deg: [0.0, -40.0, 0.0, 95.0, 0.0, 0.0, 80.0]
+    carry_joints_deg: [0.0, -20.0, 0.0, 80.0, 0.0, 0.0, 50.0]
     desk_z_surface: -0.013
     desk_size: [2.0, 2.0, 0.02]

@@ -1,10 +1,18 @@
 """Object location and scene scanning skills."""
 
+import math
+from collections import Counter
 from typing import TYPE_CHECKING
 
 from .base import SkillResult
 from ..components import perception
 from ..config import runtime_config
+from ..models.geometry import (
+    ObjectGeometry,
+    aggregate_cylinder_geometries,
+    aggregate_object_geometries,
+)
+from ..object_types import is_cylinder_target
 
 if TYPE_CHECKING:
     from ..ros_bridge import RobotBridge
@@ -47,19 +55,321 @@ def _with_bbox_3d(bridge: "RobotBridge", frame, detection: dict) -> SkillResult:
     bbox = detection.get("bbox")
     if not bbox:
         return _with_3d(bridge, frame, detection)
-    known_height = (
-        bridge.get_color_block_height()
-        if detection.get("source") == "CV" and detection.get("color") else None
-    )
-    pos = perception.bbox_to_3d(
-        bridge, frame, bbox, known_object_height=known_height,
-    )
+    pos = perception.bbox_to_3d(bridge, frame, bbox)
     if not pos.ok:
         # Fallback to center point
         return _with_3d(bridge, frame, detection)
     data = {**detection, **pos.data}
     print(f"[perception] 3D(bbox): x={pos.data['x']:.4f}, y={pos.data['y']:.4f}, z={pos.data['z']:.4f} "
           f"method={pos.data.get('method', '?')} (base_link)", flush=True)
+    return SkillResult.success(**data)
+
+
+def _locate_color_multiframe(
+    bridge: "RobotBridge",
+    target: str,
+    color_name: str,
+    location_hint: str,
+    frame_count: int | None = None,
+) -> SkillResult:
+    """Detect and median-fuse fresh HSV/RGB-D geometry before motion."""
+    if frame_count is None:
+        frame_count = bridge.get_block_depth_frames()
+    samples: list[ObjectGeometry] = []
+    successful: list[tuple[object, dict, dict]] = []
+    frame_diagnostics: list[dict] = []
+    detected_frames = 0
+
+    for sample_index in range(frame_count):
+        captured = perception.capture_image(bridge, timeout=1.5)
+        if not captured.ok:
+            frame_diagnostics.append({
+                "sample": sample_index,
+                "ok": False,
+                "error": captured.error or "capture failed",
+            })
+            continue
+        frame = captured.data["frame"]
+        detected = perception.detect_by_color(frame, color_name, location_hint)
+        if not detected.ok or not detected.data.get("found"):
+            frame_diagnostics.append({
+                "sample": sample_index,
+                "ok": False,
+                "error": "HSV target not found",
+            })
+            continue
+        detected_frames += 1
+        measured = perception.color_detection_to_3d(
+            bridge, frame, detected.data,
+        )
+        if not measured.ok:
+            frame_diagnostics.append({
+                "sample": sample_index,
+                "ok": False,
+                "error": measured.error or "geometry failed",
+            })
+            continue
+        geometry = ObjectGeometry.from_dict(measured.data["geometry"])
+        samples.append(geometry)
+        successful.append((frame, detected.data, measured.data))
+        frame_diagnostics.append({
+            "sample": sample_index,
+            "ok": True,
+            "surface_xyz": list(geometry.surface_xyz),
+            "height": geometry.height,
+            "yaw_rad": geometry.yaw_rad,
+            "surface_depth_mm": geometry.surface_depth_mm,
+            "quality": geometry.quality,
+        })
+
+    if detected_frames == 0:
+        return SkillResult.failure(
+            f"HSV target '{target}' not found in {frame_count} frames",
+            failed_step="detect",
+            retryable=True,
+            frame_diagnostics=frame_diagnostics,
+        )
+
+    aggregation = aggregate_object_geometries(
+        samples,
+        requested_frames=frame_count,
+        min_valid_frames=max(3, math.ceil(frame_count * 0.6)),
+        max_position_deviation_m=bridge.get_block_xy_max_spread(),
+        max_height_deviation_m=bridge.get_block_depth_max_spread(),
+        max_size_deviation_m=bridge.get_block_depth_max_spread(),
+        max_desk_deviation_m=bridge.get_block_depth_max_spread(),
+        max_yaw_deviation_rad=math.radians(
+            bridge.get_block_yaw_max_spread_deg(),
+        ),
+        max_depth_deviation_mm=bridge.get_block_depth_max_spread() * 1000.0,
+    )
+    if aggregation.geometry is None:
+        quality = aggregation.quality.to_dict()
+        reasons = "; ".join(quality["rejection_reasons"]) or "unknown inconsistency"
+        return SkillResult.failure(
+            f"Real-time color geometry rejected: {reasons}",
+            failed_step="geometry_consistency",
+            retryable=True,
+            geometry_quality=quality,
+            frame_diagnostics=frame_diagnostics,
+        )
+
+    geometry = aggregation.geometry
+    _, representative_detection, representative_measurement = successful[-1]
+    data = {
+        "target": target,
+        **representative_detection,
+        "x": geometry.surface_xyz[0],
+        "y": geometry.surface_xyz[1],
+        "z": geometry.surface_xyz[2],
+        "frame_id": "base_link",
+        "depth_mm": geometry.surface_depth_mm,
+        "valid_depth_points": sum(
+            int(item[2].get("valid_depth_points", 0)) for item in successful
+        ),
+        "local_desk_z": geometry.local_desk_z,
+        "object_height": geometry.height,
+        "yaw_rad": geometry.yaw_rad,
+        "method": f"realtime_depth_{frame_count}frame_median",
+        "depth_is_estimated": False,
+        "geometry": geometry.to_dict(),
+        "geometry_quality": aggregation.quality.to_dict(),
+        "frame_diagnostics": frame_diagnostics,
+    }
+    print(
+        f"[perception] 3D(color,{frame_count}f): x={data['x']:.4f}, "
+        f"y={data['y']:.4f}, z={data['z']:.4f}, "
+        f"height={geometry.height:.4f}, yaw={geometry.yaw_rad:.3f}, "
+        f"inliers={aggregation.quality.inlier_frames}/{frame_count} "
+        f"(base_link)",
+        flush=True,
+    )
+    return SkillResult.success(**data)
+
+
+def _locate_cylinder_multiframe(
+    bridge: "RobotBridge",
+    target: str,
+    yolo: "YoloDetector",
+    location_hint: str,
+    color_name: str | None,
+) -> SkillResult:
+    """YOLO-track and fuse live depth fits for upright or lying cylinders."""
+
+    # The first lazy YOLO inference can spend longer than the TF buffer cache
+    # loading weights and compiling CUDA kernels. Warm it before acquiring the
+    # first timestamped RGB-D frame so that its exact acquisition transform is
+    # still available when metric fitting begins.
+    ensure_loaded = getattr(yolo, "ensure_loaded", None)
+    if callable(ensure_loaded):
+        try:
+            ensure_loaded()
+        except Exception as error:
+            return SkillResult.failure(
+                f"YOLO initialization failed: {error}",
+                failed_step="detect",
+                retryable=False,
+            )
+
+    frame_count = bridge.get_cylinder_depth_frames()
+    samples: list[ObjectGeometry] = []
+    successful: list[tuple[dict, dict]] = []
+    diagnostics: list[dict] = []
+    detected_frames = 0
+    for sample_index in range(frame_count):
+        captured = perception.capture_image(bridge, timeout=1.5)
+        if not captured.ok:
+            diagnostics.append({
+                "sample": sample_index,
+                "ok": False,
+                "error": captured.error or "capture failed",
+            })
+            continue
+        frame = captured.data["frame"]
+        detected = perception.detect_by_yolo(
+            yolo, frame, target, location_hint,
+        )
+        if not detected.ok or not detected.data.get("found"):
+            diagnostics.append({
+                "sample": sample_index,
+                "ok": False,
+                "error": detected.error or "YOLO cylinder not found",
+            })
+            continue
+        detected_frames += 1
+        measured = perception.cylinder_detection_to_3d(
+            bridge,
+            frame,
+            detected.data,
+            color_name=color_name,
+        )
+        if not measured.ok:
+            frame_error = measured.error or "cylinder geometry failed"
+            print(
+                f"[perception] cylinder frame[{sample_index}] rejected: "
+                f"{frame_error}",
+                flush=True,
+            )
+            diagnostics.append({
+                "sample": sample_index,
+                "ok": False,
+                "error": frame_error,
+                "bbox": detected.data.get("bbox"),
+                "debug_image": measured.data.get("debug_image"),
+            })
+            continue
+        geometry = ObjectGeometry.from_dict(measured.data["geometry"])
+        samples.append(geometry)
+        successful.append((detected.data, measured.data))
+        diagnostics.append({
+            "sample": sample_index,
+            "ok": True,
+            "center_xyz": list(geometry.center_xyz),
+            "axis_xyz": list(geometry.axis_xyz),
+            "diameter_m": geometry.diameter_m,
+            "length_m": geometry.length_m,
+            "orientation": geometry.orientation_class,
+            "quality": geometry.quality,
+        })
+
+    if detected_frames == 0:
+        return SkillResult.failure(
+            f"YOLO target '{target}' not found in {frame_count} frames",
+            failed_step="detect",
+            retryable=True,
+            frame_diagnostics=diagnostics,
+        )
+    aggregation = aggregate_cylinder_geometries(
+        samples,
+        requested_frames=frame_count,
+        min_valid_frames=max(3, math.ceil(frame_count * 0.6)),
+        max_position_deviation_m=(
+            bridge.get_cylinder_position_max_spread()
+        ),
+        max_dimension_deviation_m=bridge.get_cylinder_depth_max_spread(),
+        max_desk_deviation_m=bridge.get_cylinder_depth_max_spread(),
+        max_axis_deviation_rad=math.radians(
+            bridge.get_cylinder_axis_max_spread_deg()
+        ),
+        max_depth_deviation_mm=(
+            bridge.get_cylinder_depth_max_spread() * 1000.0
+        ),
+    )
+    if aggregation.geometry is None:
+        quality = aggregation.quality.to_dict()
+        reasons = "; ".join(quality["rejection_reasons"])
+        def category(error: str) -> str:
+            lowered = error.lower()
+            if "extrapolation" in lowered or "transform" in lowered:
+                return "TF timestamp"
+            if "axis is diagonal" in lowered:
+                return "axis classification"
+            if "connected" in lowered:
+                return "connected depth support"
+            if "circle" in lowered:
+                return "circle fit"
+            if "diameter" in lowered or "length" in lowered:
+                return "dimension range"
+            if "depth" in lowered or "points above" in lowered:
+                return "depth support"
+            return error[:100]
+
+        failure_counts = Counter(
+            category(str(item["error"]))
+            for item in diagnostics
+            if not item.get("ok") and item.get("error")
+        )
+        failure_summary = ", ".join(
+            f"{label}={count}"
+            for label, count in failure_counts.most_common(3)
+        )
+        return SkillResult.failure(
+            f"Real-time cylinder geometry rejected: "
+            f"{reasons or 'unknown inconsistency'}"
+            f"{'; frame failures: ' + failure_summary if failure_summary else ''}",
+            failed_step="geometry_consistency",
+            retryable=True,
+            geometry_quality=quality,
+            frame_diagnostics=diagnostics,
+        )
+
+    geometry = aggregation.geometry
+    representative_detection, representative_measurement = successful[-1]
+    data = {
+        "target": target,
+        **representative_detection,
+        "x": geometry.surface_xyz[0],
+        "y": geometry.surface_xyz[1],
+        "z": geometry.surface_xyz[2],
+        "frame_id": "base_link",
+        "depth_mm": geometry.surface_depth_mm,
+        "valid_depth_points": sum(
+            int(measurement.get("valid_depth_points", 0))
+            for _, measurement in successful
+        ),
+        "local_desk_z": geometry.local_desk_z,
+        "object_height": geometry.height,
+        "cylinder_diameter": geometry.diameter_m,
+        "cylinder_length": geometry.length_m,
+        "cylinder_orientation": geometry.orientation_class,
+        "method": f"yolo_depth_cylinder_{frame_count}frame_median",
+        "depth_is_estimated": False,
+        "geometry": geometry.to_dict(),
+        "geometry_quality": aggregation.quality.to_dict(),
+        "frame_diagnostics": diagnostics,
+        "debug_image": representative_measurement.get("debug_image"),
+    }
+    print(
+        f"[perception] 3D(cylinder,{frame_count}f): "
+        f"center=({geometry.center_xyz[0]:.4f},"
+        f"{geometry.center_xyz[1]:.4f},{geometry.center_xyz[2]:.4f}), "
+        f"diameter={geometry.diameter_m:.4f}, "
+        f"length={geometry.length_m:.4f}, "
+        f"orientation={geometry.orientation_class}, "
+        f"inliers={aggregation.quality.inlier_frames}/{frame_count} "
+        f"(base_link)",
+        flush=True,
+    )
     return SkillResult.success(**data)
 
 
@@ -170,17 +480,37 @@ def locate_object(bridge: "RobotBridge", vlm: "VlmClient", target: str,
         location_hint: Spatial hint (left/right/center/top/bottom).
         use_vlm: Whether to use VLM as final fallback.
     """
+    color_name = _target_color(target)
+    # Cylinder geometry is shape-specific. A colored bottle must never be
+    # interpreted as a rectangular HSV top plane.
+    if is_cylinder_target(target):
+        if yolo is None:
+            return SkillResult.failure(
+                "Cylinder detection requires the lazy YOLO detector",
+                failed_step="detect",
+                retryable=False,
+            )
+        return _locate_cylinder_multiframe(
+            bridge, target, yolo, location_hint, color_name,
+        )
+
+    # ── Step 1: HSV color detection ──
+    if color_name:
+        color_result = _locate_color_multiframe(
+            bridge, target, color_name, location_hint,
+        )
+        if color_result.ok:
+            return color_result
+        # Do not let a generic detector bypass an explicit geometry safety
+        # rejection. It may remain a semantic fallback only when HSV never saw
+        # the requested color at all.
+        if color_result.failed_step != "detect":
+            return color_result
+
     frame_result = perception.capture_image(bridge)
     if not frame_result.ok:
         return SkillResult.failure(frame_result.error or "capture failed", failed_step="capture", retryable=True)
     frame = frame_result.data["frame"]
-
-    # ── Step 1: HSV color detection ──
-    color_name = _target_color(target)
-    if color_name:
-        detected = perception.detect_by_color(frame, color_name, location_hint)
-        if detected.ok and detected.data.get("found"):
-            return _with_bbox_3d(bridge, frame, {"target": target, **detected.data})
 
     # ── Step 2: YOLO detection ──
     if yolo is not None:
@@ -232,17 +562,15 @@ def scan_scene(bridge: "RobotBridge", vlm: "VlmClient" = None,
         yolo_result = perception.detect_all_by_yolo(yolo, frame)
         yolo_objects = yolo_result.data.get("objects", []) if yolo_result.ok else []
 
-    # ── Project 3D for HSV blocks ──
+    # ── Project oriented real-time geometry for HSV blocks ──
     for block in hsv_blocks:
-        center = block.get("center_2d")
-        if center:
-            pos = perception.pixel_to_3d(bridge, frame, center[0], center[1])
-            if pos.ok:
-                block.update(pos.data)
-                block["has_3d"] = True
-            else:
-                block["has_3d"] = False
-                block["error"] = pos.error
+        pos = perception.color_detection_to_3d(bridge, frame, block)
+        if pos.ok:
+            block.update(pos.data)
+            block["has_3d"] = True
+        else:
+            block["has_3d"] = False
+            block["error"] = pos.error
 
     # ── Project 3D for YOLO objects (use bbox_to_3d for better sampling) ──
     for obj in yolo_objects:

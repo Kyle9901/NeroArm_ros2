@@ -1,6 +1,7 @@
 """Joint feedback and gripper-controller adapters."""
 
 import threading
+import time
 
 from control_msgs.action import FollowJointTrajectory
 from rclpy.action import ActionClient
@@ -15,7 +16,9 @@ GRIPPER_JOINT_NAMES = ["gripper_joint1", "gripper_joint2"]
 class JointStateMonitor:
     def __init__(self, node, callback_group):
         self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
         self._message = None
+        self._sequence = 0
         self._subscription = node.create_subscription(
             JointState,
             "/feedback/joint_states",
@@ -25,17 +28,41 @@ class JointStateMonitor:
         )
 
     def _callback(self, message):
-        with self._lock:
+        with self._condition:
             self._message = message
+            self._sequence += 1
+            self._condition.notify_all()
 
     def latest_message(self):
         with self._lock:
             return self._message
 
+    def sequence(self) -> int:
+        with self._lock:
+            return self._sequence
+
+    def wait_for_newer(self, sequence: int, timeout: float) -> bool:
+        """Wait until feedback received after the caller's snapshot."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._condition:
+            while self._sequence <= int(sequence):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return False
+                self._condition.wait(remaining)
+            return True
+
     def as_dict(self) -> dict:
-        message = self.latest_message()
+        with self._lock:
+            message = self._message
+            sequence = self._sequence
         if message is None:
-            return {"joints": {}, "gripper": {}, "gripper_width": None}
+            return {
+                "joints": {},
+                "gripper": {},
+                "gripper_width": None,
+                "sequence": sequence,
+            }
         joints = {
             name: float(position)
             for name, position in zip(message.name, message.position)
@@ -49,7 +76,12 @@ class JointStateMonitor:
         width = None
         if all(name in gripper for name in GRIPPER_JOINT_NAMES):
             width = abs(gripper["gripper_joint1"] - gripper["gripper_joint2"])
-        return {"joints": joints, "gripper": gripper, "gripper_width": width}
+        return {
+            "joints": joints,
+            "gripper": gripper,
+            "gripper_width": width,
+            "sequence": sequence,
+        }
 
 
 class GripperController:

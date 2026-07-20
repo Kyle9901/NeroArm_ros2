@@ -82,6 +82,11 @@ def _json_safe(value):
     return value
 
 
+def _task_stop_requested(bridge) -> bool:
+    checker = getattr(bridge, "is_task_stop_requested", None)
+    return bool(checker()) if callable(checker) else False
+
+
 def _resolve_args(args: dict, step_outputs: dict) -> dict:
     resolved = {}
     for key, val in args.items():
@@ -109,13 +114,21 @@ def _make_step_node(step: dict, bridge, vlm, yolo, max_retries: int = _MAX_RETRI
         result = None
         args = None
         for attempt in range(max_retries + 1):
+            if _task_stop_requested(bridge):
+                result = SkillResult.failure(
+                    "Task stopped by arm_stop before the next skill/retry",
+                    failed_step=step_name,
+                    retryable=False,
+                    holding=bridge.get_holding(),
+                    stop_requested=True,
+                )
+                break
             if attempt > 0:
                 print(f"[graph] retry {step_name} ({attempt}/{max_retries})", file=sys.stderr, flush=True)
-                # Only grasp retries require motion recovery. Health/perception
-                # retries must not create robot goals or clear goal tracking.
-                if is_grasp:
-                    motion.emergency_stop(bridge)
-                    motion.go_home(bridge)
+                # The grasp skill owns its retreat/recovery semantics.  Do not
+                # request a software stop or force observation pose here:
+                # doing so destroys the known holding state and invalidates
+                # candidate-specific recovery.
 
             args = _resolve_args(step.get("args", {}), state.get("step_outputs", {}))
             if needs_yolo:
@@ -129,6 +142,14 @@ def _make_step_node(step: dict, bridge, vlm, yolo, max_retries: int = _MAX_RETRI
                 result = skill_fn(bridge, **args)
 
             if isinstance(result, SkillResult):
+                if _task_stop_requested(bridge):
+                    result = SkillResult.failure(
+                        "Task stopped by arm_stop; no further motion will be submitted",
+                        failed_step=step_name,
+                        retryable=False,
+                        holding=bridge.get_holding(),
+                        stop_requested=True,
+                    )
                 if not result.ok:
                     print(f"[graph] {step_name} attempt {attempt}: error={result.error}, failed_step={result.failed_step}, retryable={result.retryable}", file=sys.stderr, flush=True)
                 if result.ok and is_grasp and result.holding is False:
@@ -202,6 +223,8 @@ def _update_semantic_context(bridge, skill_name: str, step_name: str,
                 pick_x=output.get("pick_x"),
                 pick_y=output.get("pick_y"),
                 pick_z=output.get("pick_z"),
+                selected_candidate=output.get("selected_candidate"),
+                pick_geometry=output.get("geometry"),
             )
             bridge.add_recent_action(f"grasped {obj}")
         return
@@ -281,9 +304,39 @@ def _make_fail_node():
 
 def _make_cleanup_node(bridge):
     def node(state: TaskState) -> dict:
+        if _task_stop_requested(bridge):
+            return {
+                "status": "failed",
+                "error": "Task stopped by arm_stop",
+                "messages": state.get("messages", []) + [
+                    "已停止后续软件动作；不会自动返回观察位"
+                ],
+            }
+        holding = bridge.get_holding()
+        if holding is True:
+            return {
+                "messages": state.get("messages", []) + [
+                    "任务结束，机械臂保持 carry 姿态并继续持物"
+                ]
+            }
+        if holding is None:
+            return {
+                "messages": state.get("messages", []) + [
+                    "任务结束，但持物状态不确定；为避免误动作未返回观察位"
+                ]
+            }
         result = motion.go_home(bridge)
-        msg = "任务结束，已回到 home" if result.ok else f"任务结束，回 home 失败: {result.error}"
-        return {"messages": state.get("messages", []) + [msg]}
+        if result.ok:
+            return {
+                "messages": state.get("messages", []) + ["任务结束，已回到观察位"]
+            }
+        return {
+            "status": "failed",
+            "error": result.error or "任务结束后返回观察位失败",
+            "messages": state.get("messages", []) + [
+                f"任务动作已完成，但回观察位失败: {result.error}"
+            ],
+        }
     return node
 
 
@@ -397,11 +450,35 @@ def _fast_route(task: str, bridge) -> list[dict] | None:
         pipeline = [
             {"name": "go_home", "skill": "go_home", "args": {}},
             {"name": "locate", "skill": "locate_object", "args": {"target": target}},
-            {"name": "grasp", "skill": "grasp_object", "args": {"x": "$locate.x", "y": "$locate.y", "z": "$locate.z", "geometry": "$locate.geometry"}},
+            {
+                "name": "grasp",
+                "skill": "grasp_object",
+                "args": {
+                    "x": "$locate.x",
+                    "y": "$locate.y",
+                    "z": "$locate.z",
+                    "geometry": "$locate.geometry",
+                    "target": target,
+                },
+            },
         ]
         if place:
             if place == "原位":
-                pipeline.append({"name": "place", "skill": "place_object", "args": {"x": "$locate.x", "y": "$locate.y", "z": "$locate.z"}})
+                place_args = {
+                    "x": "$grasp.pick_x",
+                    "y": "$grasp.pick_y",
+                    "z": "$grasp.pick_z",
+                }
+                if (
+                    manipulation._is_block_target(target)
+                    or manipulation._is_cylinder_target(target)
+                ):
+                    place_args["reverse_candidate"] = "$grasp.selected_candidate"
+                pipeline.append({
+                    "name": "place",
+                    "skill": "place_object",
+                    "args": place_args,
+                })
             else:
                 pipeline.append({"name": "resolve", "skill": "resolve_place", "args": {"place": place}})
                 pipeline.append({"name": "place", "skill": "place_object", "args": {"x": "$resolve.x", "y": "$resolve.y", "z": "$resolve.z"}})
@@ -412,16 +489,27 @@ def _fast_route(task: str, bridge) -> list[dict] | None:
         if not holding:
             return None  # will be caught as error by LLM
         ctx = bridge.get_task_context()
-        x = ctx.get("pick_x")
-        y = ctx.get("pick_y")
-        z = ctx.get("pick_z") or 0.0
-        if x is None or y is None:
-            # No pick position stored, fall back to default place
+        return_original = any(
+            word in text_lower
+            for word in ("放回", "原位", "原位置", "原处")
+        )
+        if return_original:
+            x = ctx.get("pick_x")
+            y = ctx.get("pick_y")
+            z = ctx.get("pick_z") or 0.0
+            reverse_candidate = ctx.get("selected_candidate")
+        else:
             place = bridge.get_place_pose()
             x, y, z = place["x"], place["y"], place["z"]
-        return [
-            {"name": "place", "skill": "place_object", "args": {"x": x, "y": y, "z": z}},
-        ]
+            reverse_candidate = None
+        if x is None or y is None:
+            place = bridge.get_place_pose()
+            x, y, z = place["x"], place["y"], place["z"]
+            reverse_candidate = None
+        place_args = {"x": x, "y": y, "z": z}
+        if reverse_candidate:
+            place_args["reverse_candidate"] = reverse_candidate
+        return [{"name": "place", "skill": "place_object", "args": place_args}]
 
     # ── "回home" / "归位" / "回家" ──
     if any(w in text_lower for w in ("回home", "归位", "回家", "home", "go home")):
@@ -447,6 +535,17 @@ def _fast_route(task: str, bridge) -> list[dict] | None:
     if any(w in text_lower for w in ("握手", "handshake")):
         return [{"name": "handshake", "skill": "handshake", "args": {}}]
 
+    return None
+
+
+def _grasp_start_error(pipeline: list[dict], holding: bool | None) -> str | None:
+    """Reject a new pick before prepare/home can move or release anything."""
+    if not any(step.get("skill") == "grasp_object" for step in pipeline):
+        return None
+    if holding is True:
+        return "Cannot start a new grasp while an object is already held"
+    if holding is None:
+        return "Cannot start a new grasp while the holding state is unknown"
     return None
 
 
@@ -486,6 +585,9 @@ class GraphExecutor:
             pipeline = plan_pipeline(task, extra_context=context)
             if pipeline is None:
                 return GraphResult(status="failed", error="Planning LLM returned no pipeline")
+        holding_error = _grasp_start_error(pipeline, self.bridge.get_holding())
+        if holding_error:
+            return GraphResult(status="failed", error=holding_error)
         steps_str = " → ".join(s["name"] for s in pipeline)
         print(f"[graph] pipeline: {steps_str}", file=sys.stderr, flush=True)
 

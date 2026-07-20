@@ -9,6 +9,7 @@ Usage:
 import os
 import sys
 import time
+import math
 
 import cv2
 import numpy as np
@@ -21,6 +22,7 @@ if _pkg_dir not in sys.path:
 from mcp_server.ros_bridge import RobotBridge
 from mcp_server.components import perception
 from mcp_server.config import runtime_dir
+from mcp_server.models.geometry import ObjectGeometry, aggregate_object_geometries
 from mcp_server.skills.perception import _target_color
 
 
@@ -92,25 +94,73 @@ def main() -> int:
     bridge = RobotBridge()
     bridge.start()
     try:
-        captured = perception.capture_image(bridge)
-        if not captured.ok:
-            print(f"capture failed: {captured.error}")
-            return 1
-        frame = captured.data["frame"]
+        frame_count = bridge.get_block_depth_frames()
+        observations = []
+        successful_frames = []
+        for index in range(frame_count):
+            captured = perception.capture_image(bridge, timeout=1.5)
+            if not captured.ok:
+                print(f"frame[{index}]: capture failed: {captured.error}")
+                continue
+            candidate_frame = captured.data["frame"]
+            detected = perception.detect_by_color(candidate_frame, color_name)
+            if not detected.ok or not detected.data.get("found"):
+                print(f"frame[{index}]: HSV target not found")
+                continue
+            measured = perception.color_detection_to_3d(
+                bridge, candidate_frame, detected.data,
+            )
+            if not measured.ok:
+                print(f"frame[{index}]: geometry failed: {measured.error}")
+                continue
+            geometry = ObjectGeometry.from_dict(measured.data["geometry"])
+            observations.append(geometry)
+            successful_frames.append((candidate_frame, detected.data, measured.data))
+            print(
+                f"frame[{index}]: depth_mm={geometry.surface_depth_mm:.1f} "
+                f"height={geometry.height:.4f} yaw={geometry.yaw_rad:.3f} "
+                f"xyz=({geometry.surface_xyz[0]:.4f}, "
+                f"{geometry.surface_xyz[1]:.4f}, "
+                f"{geometry.surface_xyz[2]:.4f})"
+            )
 
-        detected = perception.detect_by_color(frame, color_name)
-        if not detected.ok or not detected.data.get("found"):
-            print(f"HSV target not found: {target}")
-            return 1
-        bbox = [int(value) for value in detected.data["bbox"]]
-
-        object_pos = perception.bbox_to_3d(
-            bridge, frame, bbox,
-            known_object_height=bridge.get_color_block_height(),
+        aggregation = aggregate_object_geometries(
+            observations,
+            requested_frames=frame_count,
+            min_valid_frames=max(3, math.ceil(frame_count * 0.6)),
+            max_position_deviation_m=bridge.get_block_xy_max_spread(),
+            max_height_deviation_m=bridge.get_block_depth_max_spread(),
+            max_yaw_deviation_rad=math.radians(
+                bridge.get_block_yaw_max_spread_deg(),
+            ),
+            max_depth_deviation_mm=bridge.get_block_depth_max_spread() * 1000.0,
         )
-        if not object_pos.ok:
-            print(f"object depth failed: {object_pos.error}")
+        if aggregation.geometry is None:
+            quality = aggregation.quality.to_dict()
+            print(
+                f"{frame_count}-frame geometry rejected: "
+                f"{quality['rejection_reasons']}"
+            )
             return 1
+
+        geometry = aggregation.geometry
+        frame, detection, representative = successful_frames[-1]
+        bbox = [int(value) for value in detection["bbox"]]
+        obj = {
+            **representative,
+            "x": geometry.surface_xyz[0],
+            "y": geometry.surface_xyz[1],
+            "z": geometry.surface_xyz[2],
+            "depth_mm": geometry.surface_depth_mm,
+            "local_desk_z": geometry.local_desk_z,
+            "object_height": geometry.height,
+            "yaw_rad": geometry.yaw_rad,
+            "method": f"realtime_depth_{frame_count}frame_median",
+            "valid_depth_points": sum(
+                int(item[2].get("valid_depth_points", 0))
+                for item in successful_frames
+            ),
+        }
 
         depth_h, depth_w = frame.depth.shape[:2]
         desk_samples = []
@@ -127,7 +177,9 @@ def main() -> int:
         image = frame.color.copy()
         xmin, ymin, xmax, ymax = bbox
         cv2.rectangle(image, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
-        cv2.putText(image, f"object {object_pos.data['depth_mm']:.0f}mm",
+        rotated_box = np.asarray(detection["rotated_box_2d"], dtype=np.int32)
+        cv2.polylines(image, [rotated_box], True, (0, 255, 255), 2)
+        cv2.putText(image, f"object {obj['depth_mm']:.0f}mm",
                     (xmin, max(18, ymin - 8)), cv2.FONT_HERSHEY_SIMPLEX,
                     0.5, (0, 255, 0), 2, cv2.LINE_AA)
         for sample in desk_samples:
@@ -142,15 +194,16 @@ def main() -> int:
         output_path = os.path.join(_OUTPUT_DIR, f"depth_{time.strftime('%Y%m%d_%H%M%S')}.jpg")
         cv2.imwrite(output_path, image)
 
-        obj = object_pos.data
         print(f"target={target}  color={color_name}  bbox={bbox}")
         print(f"object: depth_mm={obj['depth_mm']:.1f}  valid_points={obj['valid_depth_points']} "
               f"base_xyz=({obj['x']:.4f}, {obj['y']:.4f}, {obj['z']:.4f}) "
-              f"method={obj.get('method', '?')}")
-        if obj.get("depth_is_estimated"):
-            print(f"object_depth_source=local_desk+known_height "
-                  f"local_desk_z={obj['local_desk_z']:.4f} "
-                  f"configured_height={obj['object_height']:.4f}")
+              f"method={obj.get('method', '?')} yaw_rad={obj['yaw_rad']:.3f}")
+        print(
+            f"object_depth_source=realtime_depth_{frame_count}frame_median "
+            f"local_desk_z={obj['local_desk_z']:.4f} "
+            f"measured_height={obj['object_height']:.4f}"
+        )
+        print(f"geometry_quality={aggregation.quality.to_dict()}")
         for sample in desk_samples:
             print(f"desk_{sample['name']}: depth_mm={sample['depth_mm']:.1f} "
                   f"valid_points={sample['valid_points']} pixel={sample['pixel']} "

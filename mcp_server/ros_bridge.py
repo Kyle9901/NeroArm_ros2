@@ -8,9 +8,8 @@ Event primitives.
 Usage (from MCP server main thread):
     bridge = RobotBridge()
     bridge.start()                     # launches rclpy spin thread
-    img = bridge.capture_image()       # blocking call, returns dict
-    pos  = bridge.get_3d_position(320, 240)
-    ok   = bridge.go_home()
+    color, depth = bridge.node.get_latest_images()
+    status = bridge.health_status()
     bridge.shutdown()
 """
 
@@ -32,6 +31,7 @@ from .ros import (
 )
 from .ros.motion import MotionControllerMixin
 from .config import load_robot_parameters
+from .visualization import GraspCandidateMarkerPublisher
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════
 class RobotBridgeNode(Node, MotionControllerMixin):
@@ -64,6 +64,18 @@ class RobotBridgeNode(Node, MotionControllerMixin):
         self._init_moveit_clients()
         self.scene = PlanningSceneService(self, self.cb_group)
         self.octomap = OctomapControl(self, self.cb_group)
+        try:
+            self.grasp_candidate_markers = GraspCandidateMarkerPublisher(
+                self,
+                frame_id=self._get_param("base_frame"),
+            )
+        except Exception as error:
+            # Visualization is diagnostic only and must never block safety or
+            # planning when visualization_msgs is unavailable.
+            self.grasp_candidate_markers = None
+            self.get_logger().warn(
+                f"grasp candidate marker publisher unavailable: {error}"
+            )
 
         self.get_logger().info("RobotBridgeNode ready")
 
@@ -119,6 +131,7 @@ class RobotBridge:
         self._spin_thread: threading.Thread | None = None
         self._ready = threading.Event()
         self._shutdown_flag = False
+        self._task_stop_requested = threading.Event()
         self._holding = False    # whether gripper is currently holding an object
         self._holding_lock = threading.Lock()
         self._task_context: dict = {
@@ -145,11 +158,9 @@ class RobotBridge:
         time.sleep(1.0)  # give spin thread a moment to start
         if wait_servers:
             self._node.wait_servers()
-        # Keep MCP startup equivalent to manual MoveIt operation by default.
-        # The desk can still be enabled explicitly without changing the numeric
-        # desk-height safety clamp used by grasping.
-        if bool(self._node._get_param("desk_collision_enabled")):
-            self._node.add_desk_collision()
+        # Planning-scene setup belongs to the prepare skill.  MoveIt may not
+        # exist yet when the MCP process starts, so doing it here would add a
+        # needless service timeout and could silently miss the desk object.
         self._ready.set()
 
     def _spin_loop(self):
@@ -190,6 +201,10 @@ class RobotBridge:
     def get_grasp_quat(self) -> list[float]:
         return list(self.node._get_param("grasp_quat"))
 
+    def get_tcp_offset(self) -> list[float]:
+        """Configured link7-to-TCP transform [x, y, z, roll, pitch, yaw]."""
+        return list(self.node._get_param("tcp_offset"))
+
     def get_approach_height(self) -> float:
         return self.node._get_param("approach_height")
 
@@ -197,14 +212,104 @@ class RobotBridge:
         """Configured distance from the detected object surface to the physical fingertip."""
         return self.node._get_param("fingertip_depth")
 
-    def get_color_block_height(self) -> float:
-        return self.node._get_param("color_block_height")
-
     def get_safe_height(self) -> float:
         return self.node._get_param("safe_height")
 
+    def get_block_depth_frames(self) -> int:
+        return int(self.node._get_param("block_depth_frames"))
+
+    def get_block_depth_max_spread(self) -> float:
+        return float(self.node._get_param("block_depth_max_spread"))
+
+    def get_block_xy_max_spread(self) -> float:
+        return float(self.node._get_param("block_xy_max_spread"))
+
+    def get_block_yaw_max_spread_deg(self) -> float:
+        return float(self.node._get_param("block_yaw_max_spread_deg"))
+
+    def get_cylinder_depth_frames(self) -> int:
+        return int(self.node._get_param("cylinder_depth_frames"))
+
+    def get_cylinder_depth_max_spread(self) -> float:
+        return float(self.node._get_param("cylinder_depth_max_spread"))
+
+    def get_cylinder_position_max_spread(self) -> float:
+        return float(self.node._get_param("cylinder_position_max_spread"))
+
+    def get_cylinder_axis_max_spread_deg(self) -> float:
+        return float(self.node._get_param("cylinder_axis_max_spread_deg"))
+
+    def get_cylinder_lying_axis_max_deviation_deg(self) -> float:
+        return float(self.node._get_param(
+            "cylinder_lying_axis_max_deviation_deg"
+        ))
+
+    def get_cylinder_min_diameter_m(self) -> float:
+        return float(self.node._get_param("cylinder_min_diameter_m"))
+
+    def get_cylinder_max_diameter_m(self) -> float:
+        return float(self.node._get_param("cylinder_max_diameter_m"))
+
+    def get_cylinder_min_length_m(self) -> float:
+        return float(self.node._get_param("cylinder_min_length_m"))
+
+    def get_cylinder_max_length_m(self) -> float:
+        return float(self.node._get_param("cylinder_max_length_m"))
+
+    def get_cylinder_side_grasp_height_ratio(self) -> float:
+        return float(self.node._get_param("cylinder_side_grasp_height_ratio"))
+
+    def get_cylinder_tilt_angles_deg(self) -> list[int]:
+        return [
+            int(value)
+            for value in self.node._get_param("cylinder_tilt_angles_deg")
+        ]
+
+    def get_desk_measurement_max_error(self) -> float:
+        return float(self.node._get_param("desk_measurement_max_error"))
+
+    def get_grasp_tilt_angles_deg(self) -> list[int]:
+        return [int(value) for value in self.node._get_param("grasp_tilt_angles_deg")]
+
+    def get_grasp_pregrasp_distance(self) -> float:
+        return float(self.node._get_param("grasp_pregrasp_distance"))
+
+    def get_grasp_retreat_distance(self) -> float:
+        return float(self.node._get_param("grasp_retreat_distance"))
+
+    def get_grasp_candidate_timeout(self) -> float:
+        return float(self.node._get_param("grasp_candidate_timeout"))
+
+    def get_grasp_full_plan_candidates(self) -> int:
+        return int(self.node._get_param("grasp_full_plan_candidates"))
+
+    def get_joint7_soft_limit_deg(self) -> float:
+        return float(self.node._get_param("joint7_soft_limit_deg"))
+
+    def get_joint7_min_margin_deg(self) -> float:
+        return float(self.node._get_param("joint7_min_margin_deg"))
+
+    def get_reverse_branch_tolerance_rad(self) -> float:
+        return float(self.node._get_param("reverse_branch_tolerance_rad"))
+
+    def get_observation_joints_deg(self) -> list[float]:
+        return [float(value) for value in self.node._get_param("observation_joints_deg")]
+
+    def get_carry_joints_deg(self) -> list[float]:
+        return [float(value) for value in self.node._get_param("carry_joints_deg")]
+
+    def get_current_tcp_pose(self, timeout: float = 1.0) -> dict:
+        return self.node.transforms.lookup_pose(
+            self.node._get_param("tcp_link"),
+            self.node._get_param("base_frame"),
+            timeout,
+        )
+
     def get_desk_surface_z(self) -> float:
         return float(self.node._get_param("desk_z_surface"))
+
+    def get_desk_collision_enabled(self) -> bool:
+        return bool(self.node._get_param("desk_collision_enabled"))
 
     def get_workspace_bounds(self) -> dict[str, float]:
         return {
@@ -225,9 +330,6 @@ class RobotBridge:
     def get_gripper_close_width(self) -> float:
         return self.node._get_param("gripper_close_width")
 
-    def get_flange_to_tip(self) -> float:
-        return self.node._get_param("flange_to_tip")
-
     def get_velocity_scaling(self) -> float:
         return self.node._get_param("velocity_scaling")
 
@@ -241,7 +343,23 @@ class RobotBridge:
         return self.node._get_param("descent_accel_scaling")
 
     def emergency_stop(self) -> tuple[bool, str]:
+        self.request_task_stop()
         return self.node.emergency_stop()
+
+    # ── cooperative task stop ──
+    def request_task_stop(self) -> None:
+        """Prevent the active task from starting another skill or retry.
+
+        This is deliberately cooperative: it cannot cancel a trajectory that
+        MoveIt/controller has already accepted.
+        """
+        self._task_stop_requested.set()
+
+    def clear_task_stop(self) -> None:
+        self._task_stop_requested.clear()
+
+    def is_task_stop_requested(self) -> bool:
+        return self._task_stop_requested.is_set()
 
     def get_joint_state(self) -> dict:
         return self.node.get_joint_state()
@@ -265,11 +383,11 @@ class RobotBridge:
         return counts
 
     # ── holding state ──
-    def get_holding(self) -> bool:
+    def get_holding(self) -> bool | None:
         with self._holding_lock:
             return self._holding
 
-    def set_holding(self, value: bool) -> None:
+    def set_holding(self, value: bool | None) -> None:
         with self._holding_lock:
             self._holding = value
 
@@ -304,8 +422,8 @@ class RobotBridge:
         state = self.node.get_joint_state().get("joints", {})
         if not state:
             return False
-        home_deg = list(self.node._get_param("home_joints_deg"))
-        for name, deg in zip(ARM_JOINT_NAMES, home_deg):
+        observation_deg = self.get_observation_joints_deg()
+        for name, deg in zip(ARM_JOINT_NAMES, observation_deg):
             if name not in state:
                 return False
             if abs(state[name] - math.radians(float(deg))) > tolerance_rad:

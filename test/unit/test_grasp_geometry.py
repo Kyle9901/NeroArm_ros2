@@ -5,10 +5,9 @@ from mcp_server.skills.base import GraspGeometry
 
 def _geometry(depth=0.04):
     return GraspGeometry(
-        flange_to_tip=0.1733,
         fingertip_depth=depth,
-        approach_height=0.26,
-        safe_height=0.40,
+        approach_height=0.0867,
+        safe_height=0.2267,
         gripper_open=0.10,
         gripper_close=0.02,
         hold_margin=0.005,
@@ -19,12 +18,17 @@ def _geometry(depth=0.04):
 
 def test_fingertip_depth_is_measured_from_object_surface():
     geometry = _geometry()
-    assert geometry.fingertip_z(0.0554) == pytest.approx(0.0154)
-    assert geometry.grasp_z(0.0554) == pytest.approx(0.1887)
+    assert geometry.grasp_tcp_z(0.0554) == pytest.approx(0.0154)
 
 
-def test_clamped_depth_updates_fingertip_and_tcp_together():
+def test_clamped_depth_updates_grasp_tcp():
     geometry = _geometry().with_fingertip_depth(0.03)
     assert geometry.fingertip_depth == pytest.approx(0.03)
-    assert geometry.fingertip_z(0.0554) == pytest.approx(0.0254)
-    assert geometry.grasp_z(0.0554) == pytest.approx(0.1987)
+    assert geometry.grasp_tcp_z(0.0554) == pytest.approx(0.0254)
+
+
+def test_desk_clamp_places_tcp_exactly_on_desk():
+    surface_z = 0.0554
+    desk_z = 0.009
+    geometry = _geometry().with_fingertip_depth(surface_z - desk_z)
+    assert geometry.grasp_tcp_z(surface_z) == pytest.approx(desk_z)

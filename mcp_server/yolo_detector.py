@@ -134,13 +134,23 @@ def resolve_target_class(target: str, yolo_names: dict[int, str]) -> Optional[st
     target_lower = target.lower().strip()
 
     # Layer 1: Hardcoded mapping
+    available_names = {
+        str(name).lower(): str(name) for name in yolo_names.values()
+    }
     for cn_key, en_class in _LABEL_MAP.items():
         if cn_key in target_lower or target_lower in cn_key:
-            return en_class
+            if en_class.lower() in available_names:
+                return available_names[en_class.lower()]
+            # Stock COCO models have no separate can class. Treat a can as the
+            # bottle-like container class only when the loaded model does not
+            # provide a custom ``can`` label.
+            if en_class == "can" and "bottle" in available_names:
+                return available_names["bottle"]
+            break
 
     # Check if target already IS a valid COCO class
-    if target_lower in _COCO_CLASSES:
-        return target_lower
+    if target_lower in available_names:
+        return available_names[target_lower]
 
     # Layer 2: Fuzzy matching
     return _fuzzy_match_class(target, yolo_names)
@@ -422,6 +432,10 @@ class YoloDetector:
         """Check if model is loaded and ready."""
         return hasattr(self, "model") and self.model is not None
 
+    def ensure_loaded(self) -> "YoloDetector":
+        """Expose a common eager-ready hook for direct and lazy detectors."""
+        return self
+
 
 class LazyYoloDetector:
     """YOLO-compatible proxy which loads and warms the model on first inference."""
@@ -461,6 +475,10 @@ class LazyYoloDetector:
 
     def detect_all(self, *args, **kwargs):
         return self._get().detect_all(*args, **kwargs)
+
+    def ensure_loaded(self) -> YoloDetector:
+        """Load and warm the model before a timestamp-sensitive capture."""
+        return self._get()
 
     def is_loaded(self) -> bool:
         return self._detector is not None and self._detector.is_loaded()

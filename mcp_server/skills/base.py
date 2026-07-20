@@ -11,7 +11,6 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class GraspGeometry:
-    flange_to_tip: float
     fingertip_depth: float
     approach_height: float
     safe_height: float
@@ -24,7 +23,6 @@ class GraspGeometry:
     @classmethod
     def from_bridge(cls, bridge: "RobotBridge", hold_margin: float = 0.005) -> "GraspGeometry":
         return cls(
-            flange_to_tip=bridge.get_flange_to_tip(),
             fingertip_depth=bridge.get_fingertip_depth(),
             approach_height=bridge.get_approach_height(),
             safe_height=bridge.get_safe_height(),
@@ -38,13 +36,9 @@ class GraspGeometry:
     def is_holding(self, width: float | None) -> bool:
         return width is not None and width > self.gripper_close + self.hold_margin
 
-    def fingertip_z(self, surface_z: float) -> float:
-        """Physical fingertip Z after descending below the detected surface."""
+    def grasp_tcp_z(self, surface_z: float) -> float:
+        """Top-down TCP Z after entering below the detected object surface."""
         return surface_z - self.fingertip_depth
-
-    def grasp_z(self, surface_z: float) -> float:
-        """TCP/flange Z that places the physical fingertip at ``fingertip_z``."""
-        return self.fingertip_z(surface_z) + self.flange_to_tip
 
     def with_fingertip_depth(self, depth: float) -> "GraspGeometry":
         return replace(self, fingertip_depth=float(depth))

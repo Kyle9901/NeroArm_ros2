@@ -57,3 +57,32 @@ class TransformService:
             "y": transformed.point.y,
             "z": transformed.point.z,
         }
+
+    def lookup_pose(
+        self,
+        source_frame: str,
+        target_frame: str = "base_link",
+        timeout: float = 1.0,
+    ) -> dict:
+        """Return the latest source-frame pose expressed in target_frame."""
+        transform = self.buffer.lookup_transform(
+            target_frame,
+            source_frame,
+            Time(),
+            Duration(seconds=timeout),
+        ).transform
+        return {
+            "position": [
+                float(transform.translation.x),
+                float(transform.translation.y),
+                float(transform.translation.z),
+            ],
+            "quaternion": [
+                float(transform.rotation.x),
+                float(transform.rotation.y),
+                float(transform.rotation.z),
+                float(transform.rotation.w),
+            ],
+            "source_frame": source_frame,
+            "target_frame": target_frame,
+        }

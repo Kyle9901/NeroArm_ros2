@@ -33,6 +33,11 @@ class BringupManager:
             return True, f"started (pid={process.pid}, log={log_path})"
 
     @staticmethod
+    def _format_tcp_offset(values) -> str:
+        """Format the configured six-dimensional TCP transform for ros2 launch."""
+        return "[" + ", ".join(f"{float(value):.10g}" for value in values) + "]"
+
+    @staticmethod
     def _signal_process_group(process, sig) -> str | None:
         if process.poll() is not None:
             return None
@@ -173,10 +178,13 @@ class BringupManager:
             results["arm_launch"] = "not started: /move_action already exists"
             results["arm"] = "already_ready"
         else:
+            tcp_offset = self._format_tcp_offset(
+                self._node_provider().get_parameter("tcp_offset").value
+            )
             ok, message = self._spawn("arm", [
                 "ros2", "launch", "agx_arm_ctrl", "start_single_agx_arm_moveit.launch.py",
                 f"can_port:={can_port}", "arm_type:=nero", "effector_type:=agx_gripper",
-                "tcp_offset:=[0.0, 0.0, -0.0235, 0.0, 0.0, 0.0]",
+                f"tcp_offset:={tcp_offset}",
             ])
             results["arm_launch"] = message
             results["arm"] = "ready" if ok and self._wait_endpoint("action", "/move_action", 10.0) else "started_but_not_ready"
