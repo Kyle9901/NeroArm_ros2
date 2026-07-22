@@ -265,6 +265,46 @@ class RobotBridge:
             for value in self.node._get_param("cylinder_tilt_angles_deg")
         ]
 
+    def get_transparent_bottle_depth_frames(self) -> int:
+        return int(self.node._get_param("transparent_bottle_depth_frames"))
+
+    def get_transparent_bottle_max_capture_frames(self) -> int:
+        return int(self.node._get_param(
+            "transparent_bottle_max_capture_frames"
+        ))
+
+    def get_transparent_bottle_upright_axis_overtravel_m(self) -> float:
+        return float(self.node._get_param(
+            "transparent_bottle_upright_axis_overtravel_m"
+        ))
+
+    def get_transparent_bottle_profile(self) -> dict:
+        """Measured dimensions and sparse-depth classification thresholds."""
+        names = (
+            "transparent_bottle_diameter_m",
+            "transparent_bottle_height_m",
+            "transparent_bottle_label_bottom_m",
+            "transparent_bottle_label_height_m",
+            "transparent_bottle_upright_axis_overtravel_m",
+            "transparent_bottle_min_height_m",
+            "transparent_bottle_min_label_points",
+            "transparent_bottle_tcp_max_spread_m",
+            "transparent_bottle_upright_min_p90_m",
+            "transparent_bottle_upright_min_p95_m",
+            "transparent_bottle_lying_min_p90_m",
+            "transparent_bottle_lying_min_p95_m",
+            "transparent_bottle_lying_max_p90_m",
+            "transparent_bottle_lying_max_p95_m",
+        )
+        result = {
+            name: self.node._get_param(name)
+            for name in names
+        }
+        result["transparent_bottle_min_label_points"] = int(
+            result["transparent_bottle_min_label_points"]
+        )
+        return result
+
     def get_desk_measurement_max_error(self) -> float:
         return float(self.node._get_param("desk_measurement_max_error"))
 
@@ -323,6 +363,23 @@ class RobotBridge:
         n = self.node
         return {"x": n._get_param("place_x"), "y": n._get_param("place_y"),
                 "z": n._get_param("place_z")}
+
+    def get_stack_clearance_m(self) -> float:
+        return float(self.node._get_param("stack_clearance_m"))
+
+    def get_stack_max_overhang_m(self) -> float:
+        return float(self.node._get_param("stack_max_overhang_m"))
+
+    def get_relative_placement_clearance_m(self) -> float:
+        return float(self.node._get_param(
+            "relative_placement_clearance_m"
+        ))
+
+    def get_placement_verify_xy_tolerance_m(self) -> float:
+        return float(self.node._get_param("placement_verify_xy_tolerance_m"))
+
+    def get_placement_verify_z_tolerance_m(self) -> float:
+        return float(self.node._get_param("placement_verify_z_tolerance_m"))
 
     def get_gripper_open_width(self) -> float:
         return self.node._get_param("gripper_open_width")
@@ -465,7 +522,14 @@ class RobotBridge:
     def bringup_status(self) -> dict:
         return self.bringup.status()
 
-    def health_status(self) -> dict:
+    def health_status(self, *, require_fresh_camera: bool = True) -> dict:
+        """Return readiness with optional on-demand RGB-D validation.
+
+        Image subscriptions exist only during a capture.  General MCP status
+        therefore checks that the camera publisher and CameraInfo are present,
+        while prepare requests a new pair and enables the strict freshness and
+        registration checks.
+        """
         status = self.bringup.status()
         endpoints = status.get("endpoints", {})
         topics = status.get("topics", {})
@@ -482,6 +546,7 @@ class RobotBridge:
         checks = {
             "can_up": bool(status.get("can", {}).get("up")),
             "move_action": bool(endpoints.get("move_action")),
+            "camera_publisher": bool(endpoints.get("camera_color")),
             "planning_scene": bool(
                 endpoints.get("planning_scene_apply")
                 and endpoints.get("planning_scene_get")
@@ -500,10 +565,11 @@ class RobotBridge:
             "octomap_control": bool(endpoints.get("octomap_control")),
         }
         required = {
-            "can_up", "move_action", "planning_scene", "rgbd_pair_fresh",
-            "depth_registered", "camera_info", "handeye_publisher",
-            "camera_to_base_tf",
+            "can_up", "move_action", "camera_publisher", "planning_scene",
+            "camera_info", "handeye_publisher", "camera_to_base_tf",
         }
+        if require_fresh_camera:
+            required.update({"rgbd_pair_fresh", "depth_registered"})
         if octomap_enabled:
             required.update({
                 "pointcloud_pipeline", "octomap_cloud_publisher",
@@ -518,6 +584,8 @@ class RobotBridge:
             "failures": failures,
             "warnings": warnings,
             "checks": checks,
+            "camera_capture_mode": "on_demand",
+            "fresh_camera_required": bool(require_fresh_camera),
             "octomap_required": octomap_enabled,
             "observations": {
                 "registered_cloud_publishers": registered.get("publishers", 0),

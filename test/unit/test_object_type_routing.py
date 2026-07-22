@@ -1,6 +1,7 @@
 from mcp_server.object_types import (
     is_block_target,
     is_cylinder_target,
+    is_transparent_bottle_target,
     uses_candidate_grasp,
 )
 from mcp_server.yolo_detector import resolve_target_class
@@ -11,6 +12,10 @@ def test_candidate_shape_routing_is_explicit():
     assert is_cylinder_target("抓取红色水瓶")
     assert is_cylinder_target("pick the upright cylinder")
     assert is_cylinder_target("pick a can")
+    assert is_transparent_bottle_target("抓取矿泉水瓶")
+    assert is_transparent_bottle_target("pick bottle")
+    assert not is_transparent_bottle_target("抓取易拉罐")
+    assert not is_transparent_bottle_target("pick the opaque cylinder")
     assert not is_cylinder_target("scan the table")
     assert uses_candidate_grasp("易拉罐")
     assert not uses_candidate_grasp("杯子")

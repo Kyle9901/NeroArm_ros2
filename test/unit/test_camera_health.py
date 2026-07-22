@@ -1,8 +1,10 @@
 import threading
+from types import SimpleNamespace
 
 import numpy as np
 
 from mcp_server.ros.camera import CameraStream
+from mcp_server.ros_bridge import RobotBridge
 
 
 class _Stamp:
@@ -57,3 +59,69 @@ def test_health_rejects_unregistered_shape_mismatch():
     assert health["pair_received"] is False
     assert health["registered_shapes_match"] is False
     assert health["last_rejection"] == "shape_mismatch"
+
+
+def _robot_health_bridge(*, camera_publisher=True):
+    camera = SimpleNamespace(
+        health_status=lambda: {
+            "pair_fresh": False,
+            "registered_shapes_match": False,
+            "camera_info_received": True,
+            "pair_age_s": 9.56,
+        }
+    )
+    status = {
+        "can": {"up": True},
+        "endpoints": {
+            "move_action": True,
+            "camera_color": camera_publisher,
+            "planning_scene_apply": True,
+            "planning_scene_get": True,
+            "handeye_publisher": True,
+            "octomap_control": False,
+        },
+        "topics": {},
+        "processes": {},
+    }
+    return SimpleNamespace(
+        node=SimpleNamespace(camera=camera),
+        bringup=SimpleNamespace(status=lambda: status),
+        get_octomap_enabled_on_prepare=lambda: False,
+        can_transform=lambda *_args, **_kwargs: True,
+    )
+
+
+def test_idle_robot_status_keeps_stale_on_demand_pair_as_diagnostic():
+    health = RobotBridge.health_status(
+        _robot_health_bridge(), require_fresh_camera=False,
+    )
+
+    assert health["ready"] is True
+    assert health["failures"] == []
+    assert health["checks"]["rgbd_pair_fresh"] is False
+    assert health["checks"]["depth_registered"] is False
+    assert health["camera"]["pair_age_s"] == 9.56
+    assert health["camera_capture_mode"] == "on_demand"
+    assert health["fresh_camera_required"] is False
+
+
+def test_prepare_health_still_rejects_stale_or_unregistered_pair():
+    health = RobotBridge.health_status(
+        _robot_health_bridge(), require_fresh_camera=True,
+    )
+
+    assert health["ready"] is False
+    assert set(health["failures"]) == {
+        "rgbd_pair_fresh", "depth_registered",
+    }
+    assert health["fresh_camera_required"] is True
+
+
+def test_idle_robot_status_still_requires_camera_publisher():
+    health = RobotBridge.health_status(
+        _robot_health_bridge(camera_publisher=False),
+        require_fresh_camera=False,
+    )
+
+    assert health["ready"] is False
+    assert health["failures"] == ["camera_publisher"]

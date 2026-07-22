@@ -4,6 +4,8 @@ import math
 from collections import Counter
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 from .base import SkillResult
 from ..components import perception
 from ..config import runtime_config
@@ -12,7 +14,13 @@ from ..models.geometry import (
     aggregate_cylinder_geometries,
     aggregate_object_geometries,
 )
-from ..object_types import is_cylinder_target
+from ..object_types import (
+    is_cylinder_target,
+    is_transparent_bottle_target,
+)
+from ..perception.transparent_bottle import (
+    aggregate_transparent_bottle_measurements,
+)
 
 if TYPE_CHECKING:
     from ..ros_bridge import RobotBridge
@@ -373,6 +381,292 @@ def _locate_cylinder_multiframe(
     return SkillResult.success(**data)
 
 
+def _locate_transparent_bottle_multiframe(
+    bridge: "RobotBridge",
+    target: str,
+    yolo: "YoloDetector",
+    location_hint: str,
+) -> SkillResult:
+    """Fuse sparse label depth for the configured transparent water bottle."""
+
+    ensure_loaded = getattr(yolo, "ensure_loaded", None)
+    if callable(ensure_loaded):
+        try:
+            ensure_loaded()
+        except Exception as error:
+            return SkillResult.failure(
+                f"YOLO initialization failed: {error}",
+                failed_step="detect",
+                retryable=False,
+            )
+
+    profile = bridge.get_transparent_bottle_profile()
+    frame_count = bridge.get_transparent_bottle_depth_frames()
+    maximum_capture_frames = (
+        bridge.get_transparent_bottle_max_capture_frames()
+    )
+    minimum_frames = max(3, math.ceil(frame_count * 0.6))
+    measurements: list[tuple[dict, dict]] = []
+    diagnostics: list[dict] = []
+    detected_frames = 0
+    consensus = None
+    for sample_index in range(maximum_capture_frames):
+        captured = perception.capture_image(bridge, timeout=1.5)
+        if not captured.ok:
+            diagnostics.append({
+                "sample": sample_index,
+                "ok": False,
+                "error": captured.error or "capture failed",
+            })
+            continue
+        frame = captured.data["frame"]
+        detected = perception.detect_by_yolo(
+            yolo, frame, target, location_hint,
+        )
+        if not detected.ok or not detected.data.get("found"):
+            diagnostics.append({
+                "sample": sample_index,
+                "ok": False,
+                "error": detected.error or "YOLO bottle not found",
+            })
+            continue
+        detected_frames += 1
+        measured = perception.transparent_bottle_detection_to_3d(
+            bridge, frame, detected.data,
+        )
+        if not measured.ok:
+            error = measured.error or "transparent bottle depth failed"
+            print(
+                f"[perception] bottle frame[{sample_index}] rejected: {error}",
+                flush=True,
+            )
+            diagnostics.append({
+                "sample": sample_index,
+                "ok": False,
+                "error": error,
+                "bbox": detected.data.get("bbox"),
+                "debug_image": measured.data.get("debug_image"),
+            })
+            continue
+        measurements.append((detected.data, measured.data))
+        diagnostics.append({
+            "sample": sample_index,
+            "ok": True,
+            "orientation": measured.data["orientation"],
+            "height_p90_m": measured.data["height_p90_m"],
+            "height_p95_m": measured.data["height_p95_m"],
+            "label_depth_points": measured.data["label_depth_points"],
+            "tcp_xyz": measured.data["tcp_xyz"],
+        })
+        consensus = aggregate_transparent_bottle_measurements(
+            [data for _, data in measurements],
+            minimum_frames=minimum_frames,
+            minimum_label_points=int(
+                profile["transparent_bottle_min_label_points"]
+            ),
+            maximum_tcp_spread_m=float(
+                profile["transparent_bottle_tcp_max_spread_m"]
+            ),
+            upright_min_p90_m=float(
+                profile["transparent_bottle_upright_min_p90_m"]
+            ),
+            upright_min_p95_m=float(
+                profile["transparent_bottle_upright_min_p95_m"]
+            ),
+            lying_min_p90_m=float(
+                profile["transparent_bottle_lying_min_p90_m"]
+            ),
+            lying_min_p95_m=float(
+                profile["transparent_bottle_lying_min_p95_m"]
+            ),
+            lying_max_p90_m=float(
+                profile["transparent_bottle_lying_max_p90_m"]
+            ),
+            lying_max_p95_m=float(
+                profile["transparent_bottle_lying_max_p95_m"]
+            ),
+        )
+        if consensus.ready:
+            break
+
+    if detected_frames == 0:
+        return SkillResult.failure(
+            f"YOLO target '{target}' not found in "
+            f"{maximum_capture_frames} frames",
+            failed_step="detect",
+            retryable=True,
+            frame_diagnostics=diagnostics,
+        )
+
+    if consensus is None:
+        consensus = aggregate_transparent_bottle_measurements(
+            [data for _, data in measurements],
+            minimum_frames=minimum_frames,
+            minimum_label_points=int(
+                profile["transparent_bottle_min_label_points"]
+            ),
+            maximum_tcp_spread_m=float(
+                profile["transparent_bottle_tcp_max_spread_m"]
+            ),
+            upright_min_p90_m=float(
+                profile["transparent_bottle_upright_min_p90_m"]
+            ),
+            upright_min_p95_m=float(
+                profile["transparent_bottle_upright_min_p95_m"]
+            ),
+            lying_min_p90_m=float(
+                profile["transparent_bottle_lying_min_p90_m"]
+            ),
+            lying_min_p95_m=float(
+                profile["transparent_bottle_lying_min_p95_m"]
+            ),
+            lying_max_p90_m=float(
+                profile["transparent_bottle_lying_max_p90_m"]
+            ),
+            lying_max_p95_m=float(
+                profile["transparent_bottle_lying_max_p95_m"]
+            ),
+        )
+    if not consensus.ready:
+        return SkillResult.failure(
+            f"Transparent bottle geometry rejected after "
+            f"{len(diagnostics)}/{maximum_capture_frames} captures: "
+            f"{consensus.reason}",
+            failed_step="geometry_consistency",
+            # This function has already exhausted its adaptive capture budget.
+            # Repeating the entire batch in the graph discards useful partial
+            # frames and only multiplies latency without changing the scene.
+            retryable=False,
+            frame_diagnostics=diagnostics,
+        )
+    orientation = consensus.orientation
+    pooled_p90 = float(consensus.height_p90_m)
+    pooled_p95 = float(consensus.height_p95_m)
+    label_gate = consensus.label_gate
+    tcp_median = np.asarray(consensus.tcp_xyz, dtype=np.float64)
+    tcp_spread = float(consensus.tcp_spread_m)
+    inliers = [measurements[index] for index in consensus.inlier_indices]
+
+    diameter = float(profile["transparent_bottle_diameter_m"])
+    length = float(profile["transparent_bottle_height_m"])
+    if orientation == "upright":
+        axis_xyz = (0.0, 0.0, 1.0)
+        yaw_rad = 0.0
+        vertical_height = length
+    else:
+        minimum_axis_span = length * 0.55
+        axis_evidence = [
+            data for _, data in measurements
+            if float(data.get("horizontal_span_m", 0.0))
+            >= minimum_axis_span
+            and float(data.get("height_p90_m", math.inf))
+            <= float(profile["transparent_bottle_lying_max_p90_m"])
+            and float(data.get("height_p95_m", math.inf))
+            <= float(profile["transparent_bottle_lying_max_p95_m"])
+        ]
+        if not axis_evidence:
+            axis_evidence = [data for _, data in inliers]
+        axes = np.asarray(
+            [data["horizontal_axis_xy"] for data in axis_evidence],
+            dtype=np.float64,
+        )
+        for index in range(len(axes)):
+            if axes[index, 0] < -1e-9 or (
+                abs(float(axes[index, 0])) <= 1e-9
+                and axes[index, 1] < 0.0
+            ):
+                axes[index] *= -1.0
+        axis_xy = np.median(axes, axis=0)
+        axis_norm = float(np.linalg.norm(axis_xy))
+        if axis_norm <= 1e-9:
+            return SkillResult.failure(
+                "Transparent bottle lying axis is degenerate",
+                failed_step="geometry_consistency",
+                retryable=False,
+                frame_diagnostics=diagnostics,
+            )
+        axis_xy /= axis_norm
+        axis_xyz = (
+            float(axis_xy[0]), float(axis_xy[1]), 0.0,
+        )
+        yaw_rad = math.atan2(float(axis_xy[1]), float(axis_xy[0]))
+        vertical_height = diameter
+
+    physical_desk_z = float(bridge.get_desk_surface_z())
+    quality = {
+        "reliable": True,
+        "requested_frames": frame_count,
+        "maximum_capture_frames": maximum_capture_frames,
+        "captured_frames": len(diagnostics),
+        "valid_frames": len(measurements),
+        "inlier_frames": len(inliers),
+        "orientation": orientation,
+        "height_p90_m": float(pooled_p90),
+        "height_p95_m": float(pooled_p95),
+        "label_point_gate": label_gate,
+        "tcp_spread_m": tcp_spread,
+        "grasp_reference": "transparent_bottle_measured_label_center",
+    }
+    if orientation == "lying":
+        quality["axis_evidence_frames"] = len(axis_evidence)
+    geometry = ObjectGeometry(
+        surface_xyz=tuple(float(value) for value in tcp_median),
+        center_xyz=tuple(float(value) for value in tcp_median),
+        size_xyz=(diameter, diameter, vertical_height),
+        local_desk_z=physical_desk_z,
+        height=vertical_height,
+        height_source=(
+            f"transparent_bottle_sparse_label_{len(inliers)}frame_median"
+        ),
+        yaw_rad=yaw_rad,
+        yaw_period_rad=math.pi,
+        primary_axis_xy=(axis_xyz[0], axis_xyz[1]),
+        secondary_axis_xy=(-axis_xyz[1], axis_xyz[0]),
+        shape_kind="cylinder",
+        axis_xyz=axis_xyz,
+        diameter_m=diameter,
+        length_m=length,
+        orientation_class=orientation,
+        quality=quality,
+    )
+    representative_detection, representative = max(
+        inliers,
+        key=lambda item: int(item[1]["label_depth_points"]),
+    )
+    data = {
+        "target": target,
+        **representative_detection,
+        "x": float(tcp_median[0]),
+        "y": float(tcp_median[1]),
+        "z": float(tcp_median[2]),
+        "frame_id": "base_link",
+        "local_desk_z": physical_desk_z,
+        "object_height": vertical_height,
+        "cylinder_diameter": diameter,
+        "cylinder_length": length,
+        "cylinder_orientation": orientation,
+        "method": (
+            f"transparent_bottle_sparse_label_{frame_count}frame_median"
+        ),
+        "depth_is_estimated": False,
+        "geometry": geometry.to_dict(),
+        "geometry_quality": quality,
+        "frame_diagnostics": diagnostics,
+        "debug_image": representative.get("debug_image"),
+        "height_debug_image": representative.get("height_debug_image"),
+    }
+    print(
+        f"[perception] 3D(bottle,{frame_count}f): "
+        f"tcp=({tcp_median[0]:.4f},{tcp_median[1]:.4f},"
+        f"{tcp_median[2]:.4f}), orientation={orientation}, "
+        f"p90={pooled_p90 * 1000.0:.1f}mm, "
+        f"p95={pooled_p95 * 1000.0:.1f}mm, "
+        f"inliers={len(inliers)}/{frame_count} (base_link)",
+        flush=True,
+    )
+    return SkillResult.success(**data)
+
+
 def _compute_iou(bbox_a: list[int], bbox_b: list[int]) -> float:
     """Compute Intersection over Union between two bounding boxes."""
     x1 = max(bbox_a[0], bbox_b[0])
@@ -481,6 +775,16 @@ def locate_object(bridge: "RobotBridge", vlm: "VlmClient", target: str,
         use_vlm: Whether to use VLM as final fallback.
     """
     color_name = _target_color(target)
+    if is_transparent_bottle_target(target):
+        if yolo is None:
+            return SkillResult.failure(
+                "Transparent bottle detection requires the lazy YOLO detector",
+                failed_step="detect",
+                retryable=False,
+            )
+        return _locate_transparent_bottle_multiframe(
+            bridge, target, yolo, location_hint,
+        )
     # Cylinder geometry is shape-specific. A colored bottle must never be
     # interpreted as a rectangular HSV top plane.
     if is_cylinder_target(target):

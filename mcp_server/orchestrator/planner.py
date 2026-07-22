@@ -8,6 +8,7 @@ import re
 import requests
 
 from .planner_config import PLANNING_LLM_CONFIG
+from .task_spec import TaskSpec, TaskSpecError, task_spec_from_dict
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════
 #  Skill registry — descriptions the LLM sees
@@ -40,8 +41,8 @@ SKILL_SCHEMA = {
         "returns": "{holding, pick_x, pick_y, pick_z, gripper_width, selected_candidate}",
     },
     "place_object": {
-        "description": "将手持物体放置到 (x,y,z)。z 是放置面高度。自动处理下降和松开。",
-        "args": {"x": "float — base_link X", "y": "float — base_link Y", "z": "float — 放置面 Z"},
+        "description": "将手持物体放置到 (x,y,z)。关系放置使用已计算的 placement_candidate 保持物体-TCP变换。",
+        "args": {"x": "float — base_link X", "y": "float — base_link Y", "z": "float — 放置面 Z", "placement_candidate": "object — 可选的几何关系放置候选"},
         "returns": "{place_x, place_y, place_z}",
     },
     "open_gripper": {
@@ -75,9 +76,24 @@ SKILL_SCHEMA = {
         "returns": "{x, y, z}",
     },
     "stack_on": {
-        "description": "在参考物体坐标上叠加高度偏移。用于'放到X上方'场景。",
-        "args": {"x": "float — 参考 X", "y": "float — 参考 Y", "z": "float — 参考 Z", "height": "float — 叠加高度，默认 0.05m"},
-        "returns": "{x, y, z}",
+        "description": "根据源物体、支撑物体实时几何和抓取候选计算叠放TCP。",
+        "args": {"source_geometry": "object", "support_geometry": "object", "selected_candidate": "object"},
+        "returns": "{x, y, z, placement_candidate}",
+    },
+    "offset_from": {
+        "description": "根据两个物体实时尺寸计算左/右/前/后方的无重叠放置点。",
+        "args": {"source_geometry": "object", "reference_geometry": "object", "selected_candidate": "object", "relation": "right_of|left_of|in_front_of|behind"},
+        "returns": "{x, y, z, placement_candidate}",
+    },
+    "verify_placement": {
+        "description": "释放物体并回观察位后，验证目标物体的XY位置和顶面高度是否满足放置后置条件。",
+        "args": {
+            "observed_geometry": "object — 释放后重新检测的几何",
+            "expected_x": "float",
+            "expected_y": "float",
+            "expected_surface_z": "float",
+        },
+        "returns": "{verified, xy_error, surface_z_error}",
     },
     "prepare": {
         "description": "启动/检查机械臂、相机、手眼标定 TF 节点。",
@@ -110,8 +126,8 @@ FEW_SHOT_EXAMPLES = [
             {"name": "locate_blue", "skill": "detect_by_color", "args": {"target": "蓝色方块"}},
             {"name": "locate_red", "skill": "detect_by_color", "args": {"target": "红色物块"}},
             {"name": "grasp_blue", "skill": "grasp_object", "args": {"x": "$locate_blue.x", "y": "$locate_blue.y", "z": "$locate_blue.z", "geometry": "$locate_blue.geometry", "target": "蓝色方块"}},
-            {"name": "stack", "skill": "stack_on", "args": {"x": "$locate_red.x", "y": "$locate_red.y", "z": "$locate_red.z", "height": 0.05}},
-            {"name": "place", "skill": "place_object", "args": {"x": "$stack.x", "y": "$stack.y", "z": "$stack.z"}},
+            {"name": "stack", "skill": "stack_on", "args": {"source_geometry": "$grasp_blue.geometry", "support_geometry": "$locate_red.geometry", "selected_candidate": "$grasp_blue.selected_candidate"}},
+            {"name": "place", "skill": "place_object", "args": {"x": "$stack.x", "y": "$stack.y", "z": "$stack.z", "placement_candidate": "$stack.placement_candidate"}},
         ],
     },
     {
@@ -122,8 +138,8 @@ FEW_SHOT_EXAMPLES = [
             {"name": "locate_blue", "skill": "detect_by_color", "args": {"target": "蓝色方块"}},
             {"name": "locate_red", "skill": "detect_by_color", "args": {"target": "红色物块"}},
             {"name": "grasp_blue", "skill": "grasp_object", "args": {"x": "$locate_blue.x", "y": "$locate_blue.y", "z": "$locate_blue.z", "geometry": "$locate_blue.geometry", "target": "蓝色方块"}},
-            {"name": "resolve", "skill": "resolve_place", "args": {"place": "右边"}},
-            {"name": "place_blue", "skill": "place_object", "args": {"x": "$resolve.x", "y": "$resolve.y", "z": "$resolve.z"}},
+            {"name": "relative_place", "skill": "offset_from", "args": {"source_geometry": "$grasp_blue.geometry", "reference_geometry": "$locate_red.geometry", "selected_candidate": "$grasp_blue.selected_candidate", "relation": "right_of"}},
+            {"name": "place_blue", "skill": "place_object", "args": {"x": "$relative_place.x", "y": "$relative_place.y", "z": "$relative_place.z", "placement_candidate": "$relative_place.placement_candidate"}},
         ],
     },
     {
@@ -217,6 +233,66 @@ USER_TEMPLATE = """任务: {task}
 请输出 pipeline JSON。"""
 
 
+TASK_SPEC_EXAMPLES = [
+    {
+        "task": "抓取红色物块",
+        "result": {"intent": "pick", "source": {"name": "红色物块"}},
+    },
+    {
+        "task": "抓取红色物块并放回原位置",
+        "result": {
+            "intent": "pick_place",
+            "source": {"name": "红色物块"},
+            "destination": {"kind": "original"},
+        },
+    },
+    {
+        "task": "把蓝色物块放到红色物块上方",
+        "result": {
+            "intent": "pick_place",
+            "source": {"name": "蓝色物块"},
+            "destination": {
+                "kind": "relative",
+                "relation": "on_top_of",
+                "reference": {"name": "红色物块"},
+            },
+        },
+    },
+    {
+        "task": "把蓝色物块放到桌面右边",
+        "result": {
+            "intent": "pick_place",
+            "source": {"name": "蓝色物块"},
+            "destination": {"kind": "named_zone", "name": "right"},
+        },
+    },
+]
+
+
+TASK_SPEC_PROMPT = """你是机械臂任务语义解析器，只负责把用户命令转换为 TaskSpec。
+不要生成技能、步骤或 pipeline；执行顺序由确定性编译器负责。
+
+可用 intent:
+- pick: 抓取物体，需要 source
+- pick_place: 抓取并放置，需要 source 和 destination
+- place_held: 放置手上已有物体，需要 destination
+- scan, go_home, open_gripper, close_gripper, wave, nod, handshake
+
+source 格式: {"name": "物体描述"}
+destination 只能是以下一种:
+- {"kind": "original"}
+- {"kind": "configured"}
+- {"kind": "named_zone", "name": "right|left|center|front|back"}
+- {"kind": "absolute", "x": 0.0, "y": 0.0, "z": 0.0}
+- {"kind": "relative", "relation": "on_top_of|right_of|left_of|in_front_of|behind", "reference": {"name": "参考物体"}}
+
+“红色物块右边”是相对红色物块，不是全局 right 区域。未知或含糊的目的地不要猜成默认位置。
+如果上下文显示 holding=true，且用户要求放下、放回或放到某处，intent 必须是 place_held，不能再次 pick。
+只输出一个 JSON 对象，不要 Markdown。参考示例:
+{examples}
+"""
+
+
 # ═══════════════════════════════════════════════════════════════════════════════════════════
 #  Public API
 # ═══════════════════════════════════════════════════════════════════════════════════════════
@@ -245,10 +321,11 @@ def _extract_json(text: str) -> dict | None:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    m = re.search(r'\{[\s\S]*"pipeline"[\s\S]*\}', text)
-    if m:
+    start = text.find("{")
+    if start >= 0:
         try:
-            return json.loads(m.group())
+            parsed, _ = json.JSONDecoder().raw_decode(text[start:])
+            return parsed if isinstance(parsed, dict) else None
         except json.JSONDecodeError:
             pass
     return None
@@ -325,3 +402,68 @@ def plan_pipeline(task: str, extra_context: str = "") -> list[dict] | None:
         if skill in _SKILL_ALIASES:
             step["skill"] = _SKILL_ALIASES[skill]
     return pipeline
+
+
+def plan_task_spec(task: str, extra_context: str = "") -> TaskSpec:
+    """Use the planning LLM only as a typed semantic-parser fallback."""
+    cfg = PLANNING_LLM_CONFIG
+    if not cfg["api_key"]:
+        raise TaskSpecError(
+            "Task is not covered by the deterministic parser and "
+            "PLANNING_LLM_API_KEY is not set"
+        )
+
+    system = TASK_SPEC_PROMPT.replace(
+        "{examples}",
+        json.dumps(TASK_SPEC_EXAMPLES, ensure_ascii=False, indent=2),
+    )
+    if extra_context:
+        system += f"\n\n当前机器人上下文，仅用于消解指代和持物状态:\n{extra_context}"
+    payload = {
+        "model": cfg["model"],
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"任务: {task}\n只输出 TaskSpec JSON。"},
+        ],
+        "max_tokens": 1000,
+        "temperature": 0.0,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {cfg['api_key']}",
+    }
+    timeout = float(cfg.get("timeout", 90))
+    retries = int(cfg.get("retries", 2))
+    response = None
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            response = requests.post(
+                cfg["api_url"],
+                headers=headers,
+                json=payload,
+                timeout=timeout,
+            )
+            break
+        except requests.exceptions.RequestException as exc:
+            last_error = exc
+            if attempt >= retries:
+                raise RuntimeError(
+                    f"Planning LLM request failed after {retries + 1} attempts: {exc}"
+                ) from exc
+    if response is None:
+        raise RuntimeError(f"Planning LLM request failed: {last_error}")
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Planning LLM HTTP {response.status_code}: {response.text[:300]}"
+        )
+
+    body = response.json()
+    message = body["choices"][0]["message"]
+    text = message.get("content", "").strip()
+    if not text and "reasoning_content" in message:
+        text = message["reasoning_content"].strip()
+    parsed = _extract_json(text)
+    if parsed is None:
+        raise TaskSpecError(f"Planning LLM returned invalid TaskSpec JSON: {text[:500]}")
+    return task_spec_from_dict(parsed)

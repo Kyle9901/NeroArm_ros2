@@ -24,7 +24,9 @@ def test_repository_uses_calibrated_tcp_without_legacy_flange_compensation(
     assert valid_parameters["safe_height"] == pytest.approx(0.2267)
     assert "flange_to_tip" not in valid_parameters
     assert "color_block_height" not in valid_parameters
-    assert valid_parameters["observation_joints_deg"][-1] == pytest.approx(80.0)
+    # The observation pose is user-tunable for camera framing.  Its safety
+    # contract is the validated seven-joint shape, not one frozen joint7 angle.
+    assert len(valid_parameters["observation_joints_deg"]) == 7
     assert valid_parameters["carry_joints_deg"] == pytest.approx(
         [0.0, -20.0, 0.0, 80.0, 0.0, 0.0, 50.0]
     )
@@ -33,6 +35,43 @@ def test_repository_uses_calibrated_tcp_without_legacy_flange_compensation(
     assert valid_parameters["planned_start_tolerance_rad"] == pytest.approx(0.02)
     assert valid_parameters["reverse_branch_tolerance_rad"] == pytest.approx(0.10)
     assert valid_parameters["desk_measurement_max_error"] == pytest.approx(0.05)
+    assert valid_parameters["stack_clearance_m"] == pytest.approx(0.003)
+    assert valid_parameters["stack_max_overhang_m"] == pytest.approx(0.010)
+    assert valid_parameters["relative_placement_clearance_m"] == pytest.approx(
+        0.020
+    )
+    assert valid_parameters["placement_verify_xy_tolerance_m"] == pytest.approx(
+        0.025
+    )
+    assert valid_parameters["placement_verify_z_tolerance_m"] == pytest.approx(
+        0.025
+    )
+    assert valid_parameters["transparent_bottle_diameter_m"] == pytest.approx(
+        0.060
+    )
+    assert valid_parameters["transparent_bottle_height_m"] == pytest.approx(
+        0.170
+    )
+    assert valid_parameters[
+        "transparent_bottle_upright_axis_overtravel_m"
+    ] == pytest.approx(0.020)
+    assert valid_parameters[
+        "transparent_bottle_label_bottom_m"
+    ] == pytest.approx(0.056)
+    assert valid_parameters[
+        "transparent_bottle_label_height_m"
+    ] == pytest.approx(0.055)
+    assert valid_parameters[
+        "transparent_bottle_tcp_max_spread_m"
+    ] == pytest.approx(0.010)
+    assert valid_parameters["transparent_bottle_lying_min_p90_m"] == pytest.approx(
+        0.040
+    )
+    assert valid_parameters["transparent_bottle_lying_min_p95_m"] == pytest.approx(
+        0.045
+    )
+    assert valid_parameters["transparent_bottle_max_capture_frames"] == 30
+    assert valid_parameters["transparent_bottle_min_label_points"] == 25
 
 
 def test_default_grasp_points_calibrated_tcp_axis_down(valid_parameters):
@@ -71,6 +110,38 @@ def test_default_grasp_points_calibrated_tcp_axis_down(valid_parameters):
         ("planned_start_tolerance_rad", 0.08, "must not exceed"),
         ("reverse_branch_tolerance_rad", 0.40, "must not exceed"),
         ("desk_measurement_max_error", 0.0, "positive"),
+        ("stack_clearance_m", 0.03, "must not exceed"),
+        ("relative_placement_clearance_m", 0.11, "must not exceed"),
+        ("stack_max_overhang_m", 0.031, "must not exceed"),
+        ("placement_verify_xy_tolerance_m", 0.11, "must not exceed"),
+        ("placement_verify_z_tolerance_m", 0.11, "must not exceed"),
+        ("transparent_bottle_depth_frames", 2, "integer >= 3"),
+        (
+            "transparent_bottle_max_capture_frames",
+            4,
+            "integer >= transparent_bottle_depth_frames",
+        ),
+        ("transparent_bottle_min_label_points", 2, "integer >= 3"),
+        (
+            "transparent_bottle_label_height_m",
+            0.20,
+            "label must fit",
+        ),
+        (
+            "transparent_bottle_lying_max_p95_m",
+            0.10,
+            "safety gap",
+        ),
+        (
+            "transparent_bottle_lying_min_p90_m",
+            0.070,
+            "minimum must be below maximum",
+        ),
+        (
+            "transparent_bottle_upright_axis_overtravel_m",
+            0.030,
+            "smaller than the bottle radius",
+        ),
     ],
 )
 def test_rejects_unsafe_values(valid_parameters, name, value, expected):

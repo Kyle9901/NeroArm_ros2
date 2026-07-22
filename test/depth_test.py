@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Measure an HSV block and the surrounding local desk in one frame.
+"""Measure an HSV block or the calibrated transparent water bottle.
 
 Usage:
     source scripts/run_mcp.sh
     python -m test.depth_test 红色物块
+    python -m test.depth_test 水瓶
 """
 
+from collections import Counter
 import os
 import sys
 import time
@@ -23,7 +25,12 @@ from mcp_server.ros_bridge import RobotBridge
 from mcp_server.components import perception
 from mcp_server.config import runtime_dir
 from mcp_server.models.geometry import ObjectGeometry, aggregate_object_geometries
+from mcp_server.object_types import is_transparent_bottle_target
+from mcp_server.perception.transparent_bottle import (
+    aggregate_transparent_bottle_measurements,
+)
 from mcp_server.skills.perception import _target_color
+from mcp_server.yolo_detector import LazyYoloDetector
 
 
 _OUTPUT_DIR = str(runtime_dir("depth_test"))
@@ -84,16 +91,224 @@ def _desk_rois(bbox, width: int, height: int):
     return result
 
 
+def _run_transparent_bottle_test(bridge, target: str) -> int:
+    """Measure five sparse-depth frames without commanding robot motion."""
+
+    yolo = LazyYoloDetector()
+    try:
+        yolo.ensure_loaded()
+    except Exception as error:
+        print(f"YOLO initialization failed: {error}")
+        return 1
+
+    frame_count = bridge.get_transparent_bottle_depth_frames()
+    maximum_capture_frames = (
+        bridge.get_transparent_bottle_max_capture_frames()
+    )
+    minimum_consensus = max(3, math.ceil(frame_count * 0.6))
+    profile = bridge.get_transparent_bottle_profile()
+
+    def build_consensus(values):
+        return aggregate_transparent_bottle_measurements(
+            values,
+            minimum_frames=minimum_consensus,
+            minimum_label_points=int(
+                profile["transparent_bottle_min_label_points"]
+            ),
+            maximum_tcp_spread_m=float(
+                profile["transparent_bottle_tcp_max_spread_m"]
+            ),
+            upright_min_p90_m=float(
+                profile["transparent_bottle_upright_min_p90_m"]
+            ),
+            upright_min_p95_m=float(
+                profile["transparent_bottle_upright_min_p95_m"]
+            ),
+            lying_min_p90_m=float(
+                profile["transparent_bottle_lying_min_p90_m"]
+            ),
+            lying_min_p95_m=float(
+                profile["transparent_bottle_lying_min_p95_m"]
+            ),
+            lying_max_p90_m=float(
+                profile["transparent_bottle_lying_max_p90_m"]
+            ),
+            lying_max_p95_m=float(
+                profile["transparent_bottle_lying_max_p95_m"]
+            ),
+        )
+
+    measurements = []
+    last_debug = {}
+    debug_snapshots = {}
+    consensus = None
+    for index in range(maximum_capture_frames):
+        captured = perception.capture_image(bridge, timeout=1.5)
+        if not captured.ok:
+            print(f"frame[{index}]: capture failed: {captured.error}")
+            continue
+        frame = captured.data["frame"]
+        detected = perception.detect_by_yolo(yolo, frame, target)
+        if not detected.ok or not detected.data.get("found"):
+            print(
+                f"frame[{index}]: YOLO bottle not found"
+                + (f": {detected.error}" if detected.error else "")
+            )
+            continue
+        measured = perception.transparent_bottle_detection_to_3d(
+            bridge,
+            frame,
+            detected.data,
+        )
+        if not measured.ok:
+            print(
+                f"frame[{index}]: bottle depth failed: {measured.error}"
+            )
+            continue
+        data = measured.data
+        measurements.append(data)
+        last_debug = {
+            "pose": data.get("debug_image"),
+            "height": data.get("height_debug_image"),
+        }
+        debug_snapshots[id(data)] = {
+            name: (
+                cv2.imread(path)
+                if path and os.path.isfile(path)
+                else None
+            )
+            for name, path in last_debug.items()
+        }
+        label = data["label_surface_xyz"]
+        tcp = data["tcp_xyz"]
+        print(
+            f"frame[{index}]: pose={data['orientation']} "
+            f"p90={data['height_p90_m'] * 1000.0:.1f}mm "
+            f"p95={data['height_p95_m'] * 1000.0:.1f}mm "
+            f"support={data['valid_depth_points']} "
+            f"label={data['label_depth_points']} "
+            f"label_surface=({label[0]:.4f},{label[1]:.4f},"
+            f"{label[2]:.4f}) "
+            f"tcp=({tcp[0]:.4f},{tcp[1]:.4f},{tcp[2]:.4f})"
+        )
+        consensus = build_consensus(measurements)
+        if consensus.ready:
+            print(
+                f"adaptive capture reached stable consensus after "
+                f"{index + 1} frame(s)"
+            )
+            break
+
+    if consensus is None:
+        consensus = build_consensus(measurements)
+    if not consensus.ready:
+        print(
+            f"bottle measurement rejected after at most "
+            f"{maximum_capture_frames} captures: {consensus.reason}"
+        )
+        return 1
+
+    pose_counts = Counter(
+        item["orientation"]
+        for item in measurements
+        if item["orientation"] in {"upright", "lying"}
+    )
+    orientation = consensus.orientation
+    p90 = float(consensus.height_p90_m)
+    p95 = float(consensus.height_p95_m)
+    minimum_quality_points = consensus.label_gate
+    inliers = [measurements[index] for index in consensus.inlier_indices]
+    inlier_count = len(inliers)
+    representative = max(
+        inliers,
+        key=lambda item: int(item["label_depth_points"]),
+    )
+    representative_snapshot = debug_snapshots.get(id(representative), {})
+    for name, image in representative_snapshot.items():
+        path = last_debug.get(name)
+        if path and image is not None:
+            cv2.imwrite(path, image)
+    tcp_samples = np.asarray(
+        [item["tcp_xyz"] for item in inliers], dtype=np.float64,
+    )
+    label_samples = np.asarray(
+        [item["label_surface_xyz"] for item in inliers], dtype=np.float64,
+    )
+    tcp = np.asarray(consensus.tcp_xyz, dtype=np.float64)
+    label = np.median(label_samples, axis=0)
+    desk_z = float(np.median([
+        item["local_desk_z"] for item in inliers
+    ]))
+    tcp_spread = float(consensus.tcp_spread_m)
+    maximum_tcp_spread = float(
+        profile["transparent_bottle_tcp_max_spread_m"]
+    )
+    tcp_stable = consensus.ready
+
+    print(
+        f"target={target} source=YOLO quality_measurements="
+        f"{len(measurements)} captures<= {maximum_capture_frames}"
+    )
+    print(
+        f"pose={orientation} quality_frames={inlier_count}/{frame_count} "
+        f"per_frame_counts={dict(pose_counts)} "
+        f"label_gate>={minimum_quality_points}"
+    )
+    print(
+        f"height_above_desk: p90={p90 * 1000.0:.1f}mm "
+        f"p95={p95 * 1000.0:.1f}mm local_desk_z={desk_z:.4f}"
+    )
+    print(
+        f"label_surface_median=({label[0]:.4f}, {label[1]:.4f}, "
+        f"{label[2]:.4f})"
+    )
+    print(
+        f"recommended_tcp=({tcp[0]:.4f}, {tcp[1]:.4f}, "
+        f"{tcp[2]:.4f}) spread={tcp_spread * 1000.0:.1f}mm"
+    )
+    print(
+        "tcp_quality="
+        + (
+            "stable"
+            if tcp_stable
+            else (
+                f"provisional: quality_frames={inlier_count}/"
+                f"{minimum_consensus}, spread={tcp_spread * 1000.0:.1f}/"
+                f"{maximum_tcp_spread * 1000.0:.1f}mm"
+            )
+        )
+    )
+    print(
+        "grasp_strategy="
+        + (
+            "horizontal_side_grasp_at_measured_label_z"
+            if orientation == "upright"
+            else "vertical_top_grasp_at_measured_bottle_axis"
+        )
+    )
+    if last_debug.get("pose"):
+        print(f"pose_debug_image={last_debug['pose']}")
+    if last_debug.get("height"):
+        print(f"height_debug_image={last_debug['height']}")
+    return 0 if tcp_stable else 1
+
+
 def main() -> int:
     target = sys.argv[1] if len(sys.argv) > 1 else "红色物块"
-    color_name = _target_color(target)
-    if color_name is None:
-        print(f"target must contain a supported color: {target}")
-        return 1
 
     bridge = RobotBridge()
     bridge.start()
     try:
+        if is_transparent_bottle_target(target):
+            return _run_transparent_bottle_test(bridge, target)
+
+        color_name = _target_color(target)
+        if color_name is None:
+            print(
+                f"target must be the configured transparent bottle or "
+                f"contain a supported color: {target}"
+            )
+            return 1
         frame_count = bridge.get_block_depth_frames()
         observations = []
         successful_frames = []

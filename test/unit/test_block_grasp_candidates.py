@@ -56,6 +56,10 @@ def test_generates_requested_top_and_tilt_groups(candidates):
         60.0: 4,
     }
     assert len({candidate.source for candidate in candidates}) == 10
+    assert {
+        tilt: {candidate.preference_rank for candidate in candidates if candidate.tilt_deg == tilt}
+        for tilt in (0.0, 30.0, 60.0)
+    } == {0.0: {0}, 30.0: {1}, 60.0: {2}}
 
 
 def test_tcp_axes_match_approach_and_parallel_jaw_edge(candidates):

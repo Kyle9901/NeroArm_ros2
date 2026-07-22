@@ -310,53 +310,79 @@ class CandidateEvaluator:
         )
         full_count = 0
         fully_feasible: list[CandidateEvaluation] = []
-        for evaluation in ranked[: self._full_plan_count]:
-            remaining = deadline - self._clock()
-            if remaining <= 0.0:
-                timed_out = True
-                self._publish(
-                    evaluation,
-                    CandidateMarkerStatus.REJECTED,
-                    "evaluation deadline exceeded before full plan",
-                )
-                continue
-            try:
-                full = self._full_plan(
-                    evaluation.candidate,
-                    evaluation.cheap_check,
-                    remaining,
-                )
-            except Exception as error:
-                full = FullPlanResult(False, reason=f"full plan error: {error}")
-            full_count += 1
-            evaluation.full_plan = full
-            if self._clock() > deadline:
-                timed_out = True
-                self._publish(
-                    evaluation,
-                    CandidateMarkerStatus.REJECTED,
-                    "evaluation deadline exceeded during full plan",
-                )
-                continue
-            if not full.feasible:
-                self._publish(
-                    evaluation,
-                    CandidateMarkerStatus.REJECTED,
-                    full.reason or "complete plan rejected",
-                )
-                continue
-            if full.total_joint_motion_rad is not None:
-                if not math.isfinite(full.total_joint_motion_rad):
+        preference_groups: dict[float, list[CandidateEvaluation]] = {}
+        for evaluation in ranked:
+            rank = float(getattr(evaluation.candidate, "preference_rank", 0))
+            preference_groups.setdefault(rank, []).append(evaluation)
+
+        # ``full_plan_count`` is the budget inside one preference family.  If
+        # every complete path in the preferred family fails, continue with the
+        # next family instead of failing without trying the configured
+        # fallback angle.  Once a family has a complete path, lower-priority
+        # families are intentionally not planned.
+        for group in preference_groups.values():
+            group_feasible: list[CandidateEvaluation] = []
+            for evaluation in group[: self._full_plan_count]:
+                remaining = deadline - self._clock()
+                if remaining <= 0.0:
+                    timed_out = True
                     self._publish(
                         evaluation,
                         CandidateMarkerStatus.REJECTED,
-                        "full plan returned non-finite joint motion",
+                        "evaluation deadline exceeded before full plan",
+                    )
+                    break
+                try:
+                    full = self._full_plan(
+                        evaluation.candidate,
+                        evaluation.cheap_check,
+                        remaining,
+                    )
+                except Exception as error:
+                    full = FullPlanResult(False, reason=f"full plan error: {error}")
+                full_count += 1
+                evaluation.full_plan = full
+                if self._clock() > deadline:
+                    timed_out = True
+                    self._publish(
+                        evaluation,
+                        CandidateMarkerStatus.REJECTED,
+                        "evaluation deadline exceeded during full plan",
+                    )
+                    break
+                if not full.feasible:
+                    self._publish(
+                        evaluation,
+                        CandidateMarkerStatus.REJECTED,
+                        full.reason or "complete plan rejected",
                     )
                     continue
-                evaluation.total_joint_motion_rad = float(
-                    full.total_joint_motion_rad
-                )
-            fully_feasible.append(evaluation)
+                if full.total_joint_motion_rad is not None:
+                    if not math.isfinite(full.total_joint_motion_rad):
+                        self._publish(
+                            evaluation,
+                            CandidateMarkerStatus.REJECTED,
+                            "full plan returned non-finite joint motion",
+                        )
+                        continue
+                    evaluation.total_joint_motion_rad = float(
+                        full.total_joint_motion_rad
+                    )
+                group_feasible.append(evaluation)
+            if group_feasible:
+                fully_feasible.extend(group_feasible)
+                break
+            if timed_out:
+                break
+
+        if timed_out:
+            for evaluation in evaluations:
+                if evaluation.status is CandidateMarkerStatus.FEASIBLE:
+                    self._publish(
+                        evaluation,
+                        CandidateMarkerStatus.REJECTED,
+                        "evaluation deadline exceeded before complete plan",
+                    )
 
         selected = (
             min(fully_feasible, key=lambda evaluation: evaluation.ranking_key)

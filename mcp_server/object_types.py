@@ -6,6 +6,13 @@ import re
 
 
 _BLOCK_KEYWORDS = ("方块", "物块", "cube", "block")
+_TRANSPARENT_BOTTLE_KEYWORDS = (
+    "水瓶",
+    "矿泉水瓶",
+    "塑料瓶",
+    "饮料瓶",
+    "bottle",
+)
 _CYLINDER_KEYWORDS = (
     "水瓶",
     "矿泉水瓶",
@@ -40,6 +47,17 @@ def is_cylinder_target(target: str | None) -> bool:
         elif keyword in lowered:
             return True
     return False
+
+
+def is_transparent_bottle_target(target: str | None) -> bool:
+    """Return whether the current single transparent-bottle profile applies."""
+    if not target:
+        return False
+    lowered = target.lower()
+    return any(
+        keyword in lowered
+        for keyword in _TRANSPARENT_BOTTLE_KEYWORDS
+    )
 
 
 def uses_candidate_grasp(target: str | None) -> bool:

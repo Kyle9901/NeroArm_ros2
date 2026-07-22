@@ -228,8 +228,11 @@ def generate_block_grasp_candidates(
     a horizontal side grasp (which this generator intentionally omits).
 
     The returned candidates are ordered by the TCP orientation change from the
-    current pose.  Each candidate first chooses the closer of the equivalent
-    ``+Y`` and ``-Y`` parallel-jaw orientations.
+    current pose.  ``preference_rank`` separately preserves the physical grasp
+    priority requested by the operator: 90, 60, then 30 degrees relative to
+    the table (0, 30, then 60 degrees away from vertical).  Each candidate
+    first chooses the closer of the equivalent ``+Y`` and ``-Y`` parallel-jaw
+    orientations.
     """
 
     center = _as_finite_tuple(
@@ -271,6 +274,7 @@ def generate_block_grasp_candidates(
             current_quaternion=current,
             pregrasp_distance=pregrasp_distance,
             retreat_distance=retreat_distance,
+            preference_rank=0,
         )
     )
     candidates.append(
@@ -284,6 +288,7 @@ def generate_block_grasp_candidates(
             current_quaternion=current,
             pregrasp_distance=pregrasp_distance,
             retreat_distance=retreat_distance,
+            preference_rank=0,
         )
     )
 
@@ -316,6 +321,7 @@ def generate_block_grasp_candidates(
                     current_quaternion=current,
                     pregrasp_distance=pregrasp_distance,
                     retreat_distance=retreat_distance,
+                    preference_rank=int(tilt_deg // 30.0),
                 )
             )
 

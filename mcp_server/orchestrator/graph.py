@@ -11,8 +11,13 @@ from typing import Any, Literal, TypedDict
 
 from langgraph.graph import StateGraph, START, END
 
-from .planner import plan_pipeline, SKILL_SCHEMA
-from .planner_config import PLANNING_LLM_CONFIG
+from .planner import plan_task_spec
+from .task_spec import (
+    TaskSpecError,
+    compile_task_spec,
+    parse_fast_task,
+    validate_pipeline,
+)
 from ..components import motion
 from ..skills import basic, gestures, manipulation, perception, placement, prepare
 from ..skills.base import SkillResult
@@ -34,6 +39,8 @@ _SKILL_FNS = {
     "place_object": manipulation.place_object,
     "resolve_place": placement.resolve_place,
     "stack_on": placement.stack_on,
+    "offset_from": placement.offset_from,
+    "verify_placement": placement.verify_placement,
     "prepare": prepare.prepare,
     "open_gripper": basic.open_gripper,
     "close_gripper": basic.close_gripper,
@@ -325,6 +332,31 @@ def _make_cleanup_node(bridge):
                     "任务结束，但持物状态不确定；为避免误动作未返回观察位"
                 ]
             }
+        pipeline = state.get("pipeline", [])
+        if isinstance(pipeline, list):
+            last_home = max(
+                (
+                    index for index, step in enumerate(pipeline)
+                    if isinstance(step, dict) and step.get("skill") == "go_home"
+                ),
+                default=-1,
+            )
+            last_other_motion = max(
+                (
+                    index for index, step in enumerate(pipeline)
+                    if isinstance(step, dict) and step.get("skill") in {
+                        "grasp_object", "place_object", "open_gripper",
+                        "close_gripper", "wave", "nod", "handshake",
+                    }
+                ),
+                default=-1,
+            )
+            if last_home > last_other_motion:
+                return {
+                    "messages": state.get("messages", []) + [
+                        "任务结束，机械臂已在观察位"
+                    ]
+                }
         result = motion.go_home(bridge)
         if result.ok:
             return {
@@ -381,161 +413,10 @@ def build_graph(pipeline: list[dict], bridge, vlm, yolo,
 #  Fast rule matching — skips LLM for simple, deterministic tasks
 # ═══════════════════════════════════════════════════════════════════════════════════════════
 
-import re as _re
-
-# Pre-defined place keywords → resolve_place arg
-_PLACE_KEYWORDS = {
-    "右边": "右边", "右边": "右边", "right": "右边",
-    "左边": "左边", "左边": "左边", "left": "左边",
-    "中间": "中间", "中间": "中间", "center": "中间",
-    "前面": "前面", "前面": "前面", "front": "前面",
-    "后面": "后面", "后面": "后面", "back": "后面",
-    "原位": "原位", "原位置": "原位", "原处": "原位",
-}
-
-
-def _parse_pick_place(text: str) -> tuple[str | None, str | None]:
-    """Extract (target_object, place_location) from pick-and-place task text.
-
-    Returns (target, place) where target is the object description and place
-    is the destination keyword. Both can be None if not found.
-    """
-    target = None
-    place = None
-
-    # Pattern: "抓取X并放到Y" / "抓取X放到Y" / "把X放到Y"
-    m = _re.search(r"(?:抓取|拿起|pick\s*(?:up)?)\s*(.+?)\s*(?:并|然后|再)?\s*(?:放到|放回|放到|放置到|移动到|place\s*(?:to|at)?)\s*(.+)", text)
-    if m:
-        target = m.group(1).strip()
-        place_raw = m.group(2).strip()
-        for kw, mapped in _PLACE_KEYWORDS.items():
-            if kw in place_raw:
-                place = mapped
-                break
-        if place is None:
-            place = place_raw  # use as-is if no keyword match
-        return target, place
-
-    # Pattern: "抓取X" / "拿起X" (no place, just grasp)
-    m = _re.search(r"(?:抓取|拿起|pick\s*(?:up)?)\s*(.+)", text)
-    if m:
-        target = m.group(1).strip()
-        return target, None
-
-    # Pattern: "把X放到Y" / "将X放到Y" / "把X放在Y"
-    m = _re.search(r"(?:把|将)\s*(.+?)\s*(?:放到|放在|放回|放到|放置到|移动到)\s*(.+)", text)
-    if m:
-        target = m.group(1).strip()
-        place_raw = m.group(2).strip()
-        for kw, mapped in _PLACE_KEYWORDS.items():
-            if kw in place_raw:
-                place = mapped
-                break
-        if place is None:
-            place = place_raw
-        return target, place
-
-    return None, None
-
-
 def _fast_route(task: str, bridge) -> list[dict] | None:
-    """Return a pipeline for simple tasks, or None to fall through to LLM."""
-    text = task.strip()
-    text_lower = text.lower()
-    holding = bridge.get_holding()
-
-    # ── "抓取X并放到Y" / "抓取X" ──
-    target, place = _parse_pick_place(text)
-    if target:
-        pipeline = [
-            {"name": "go_home", "skill": "go_home", "args": {}},
-            {"name": "locate", "skill": "locate_object", "args": {"target": target}},
-            {
-                "name": "grasp",
-                "skill": "grasp_object",
-                "args": {
-                    "x": "$locate.x",
-                    "y": "$locate.y",
-                    "z": "$locate.z",
-                    "geometry": "$locate.geometry",
-                    "target": target,
-                },
-            },
-        ]
-        if place:
-            if place == "原位":
-                place_args = {
-                    "x": "$grasp.pick_x",
-                    "y": "$grasp.pick_y",
-                    "z": "$grasp.pick_z",
-                }
-                if (
-                    manipulation._is_block_target(target)
-                    or manipulation._is_cylinder_target(target)
-                ):
-                    place_args["reverse_candidate"] = "$grasp.selected_candidate"
-                pipeline.append({
-                    "name": "place",
-                    "skill": "place_object",
-                    "args": place_args,
-                })
-            else:
-                pipeline.append({"name": "resolve", "skill": "resolve_place", "args": {"place": place}})
-                pipeline.append({"name": "place", "skill": "place_object", "args": {"x": "$resolve.x", "y": "$resolve.y", "z": "$resolve.z"}})
-        return pipeline
-
-    # ── "放下" / "放回原位" / "放置" ──
-    if any(w in text_lower for w in ("放下", "放回", "放下来", "放置", "put down", "drop")):
-        if not holding:
-            return None  # will be caught as error by LLM
-        ctx = bridge.get_task_context()
-        return_original = any(
-            word in text_lower
-            for word in ("放回", "原位", "原位置", "原处")
-        )
-        if return_original:
-            x = ctx.get("pick_x")
-            y = ctx.get("pick_y")
-            z = ctx.get("pick_z") or 0.0
-            reverse_candidate = ctx.get("selected_candidate")
-        else:
-            place = bridge.get_place_pose()
-            x, y, z = place["x"], place["y"], place["z"]
-            reverse_candidate = None
-        if x is None or y is None:
-            place = bridge.get_place_pose()
-            x, y, z = place["x"], place["y"], place["z"]
-            reverse_candidate = None
-        place_args = {"x": x, "y": y, "z": z}
-        if reverse_candidate:
-            place_args["reverse_candidate"] = reverse_candidate
-        return [{"name": "place", "skill": "place_object", "args": place_args}]
-
-    # ── "回home" / "归位" / "回家" ──
-    if any(w in text_lower for w in ("回home", "归位", "回家", "home", "go home")):
-        return [{"name": "home", "skill": "go_home", "args": {}}]
-
-    # ── "打开夹爪" / "松手" / "释放" ──
-    if any(w in text_lower for w in ("打开夹爪", "松手", "释放", "open gripper", "release")):
-        return [{"name": "open", "skill": "open_gripper", "args": {}}]
-
-    # ── "闭合夹爪" / "夹紧" ──
-    if any(w in text_lower for w in ("闭合夹爪", "夹紧", "close gripper")):
-        return [{"name": "close", "skill": "close_gripper", "args": {}}]
-
-    # ── "挥手" / "wave" / "摆动" ──
-    if any(w in text_lower for w in ("挥手", "wave", "摆动", "打招呼", "摇手")):
-        return [{"name": "wave", "skill": "wave", "args": {}}]
-
-    # ── "点头" / "nod" ──
-    if any(w in text_lower for w in ("点头", "nod")):
-        return [{"name": "nod", "skill": "nod", "args": {}}]
-
-    # ── "握手" / "handshake" ──
-    if any(w in text_lower for w in ("握手", "handshake")):
-        return [{"name": "handshake", "skill": "handshake", "args": {}}]
-
-    return None
+    """Compatibility entrypoint backed by typed parsing and compilation."""
+    spec = parse_fast_task(task)
+    return compile_task_spec(spec, bridge) if spec is not None else None
 
 
 def _grasp_start_error(pipeline: list[dict], holding: bool | None) -> str | None:
@@ -574,17 +455,18 @@ class GraphExecutor:
     def execute_task(self, task: str, params: dict[str, Any] | None = None) -> GraphResult:
         params = params or {}
 
-        # ── 1. Fast rule matching (skip LLM) ──
-        pipeline = _fast_route(task, self.bridge)
-        if pipeline is not None:
-            print(f"[graph] fast route: {task}", file=sys.stderr, flush=True)
-        else:
-            # ── 2. Planning LLM ──
-            context = self.bridge.build_planning_context()
-            print(f"[graph] planning: {task}\n{context}", file=sys.stderr, flush=True)
-            pipeline = plan_pipeline(task, extra_context=context)
-            if pipeline is None:
-                return GraphResult(status="failed", error="Planning LLM returned no pipeline")
+        # ── 1. Both parsers produce TaskSpec; one compiler owns behavior ──
+        try:
+            spec = parse_fast_task(task)
+            if spec is not None:
+                print(f"[graph] fast route: {task}", file=sys.stderr, flush=True)
+            else:
+                context = self.bridge.build_planning_context()
+                print(f"[graph] planning semantics: {task}\n{context}", file=sys.stderr, flush=True)
+                spec = plan_task_spec(task, extra_context=context)
+            pipeline = compile_task_spec(spec, self.bridge)
+        except (TaskSpecError, RuntimeError) as exc:
+            return GraphResult(status="failed", error=str(exc))
         holding_error = _grasp_start_error(pipeline, self.bridge.get_holding())
         if holding_error:
             return GraphResult(status="failed", error=holding_error)
@@ -608,13 +490,11 @@ class GraphExecutor:
                 if key in step.get("args", {}):
                     step["args"][key] = val
 
-        # ── 5. Validate pipeline ──
-        for step in pipeline:
-            skill = step.get("skill")
-            if skill not in _SKILL_FNS:
-                return GraphResult(status="failed", error=f"Unknown skill: {skill}")
-            if skill in ("locate_object", "grasp_object", "place_object") and "args" not in step:
-                return GraphResult(status="failed", error=f"Step {step['name']} missing args")
+        # ── 5. Validate dataflow and safety invariants before any skill runs ──
+        try:
+            validate_pipeline(pipeline, set(_SKILL_FNS))
+        except TaskSpecError as exc:
+            return GraphResult(status="failed", error=str(exc))
 
         # ── 6. Build + run graph ──
         graph = build_graph(pipeline, self.bridge, self.vlm, self.yolo)

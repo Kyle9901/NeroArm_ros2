@@ -96,7 +96,10 @@ def prepare(bridge: "RobotBridge", can_port: str = "can0",
         )
 
     frame = perception.capture_image(bridge, timeout=5.0)
-    health = bridge.health_status()
+    # This is the strict health gate: capture_image above must have produced a
+    # new registered RGB-D pair.  arm_get_status intentionally uses the idle
+    # mode because image subscriptions are stopped between captures.
+    health = bridge.health_status(require_fresh_camera=True)
     if not health["ready"]:
         failures = ", ".join(health["failures"])
         camera_reason = health.get("camera", {}).get("last_rejection")

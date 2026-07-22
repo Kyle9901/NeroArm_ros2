@@ -6,9 +6,11 @@ import pytest
 from mcp_server.components.base import ComponentResult
 from mcp_server.grasping.pipeline import (
     _joint7_path_limit_error,
+    _joint7_stage_margins_deg,
     _minimum_joint7_margin_deg,
     plan_block_grasp,
     plan_cylinder_grasp,
+    plan_transparent_bottle_grasp,
 )
 from mcp_server.models import ObjectGeometry
 
@@ -79,6 +81,10 @@ class _Bridge:
         return 0.45
 
     @staticmethod
+    def get_transparent_bottle_upright_axis_overtravel_m():
+        return 0.020
+
+    @staticmethod
     def get_gripper_open_width():
         return 0.10
 
@@ -134,6 +140,24 @@ def _cylinder_geometry():
         axis_xyz=(0.0, 0.0, 1.0),
         diameter_m=0.064,
         length_m=0.22,
+        orientation_class="upright",
+    )
+
+
+def _transparent_bottle_geometry():
+    return ObjectGeometry(
+        surface_xyz=(-0.38, 0.02, 0.071),
+        center_xyz=(-0.38, 0.02, 0.071),
+        size_xyz=(0.060, 0.060, 0.170),
+        local_desk_z=-0.013,
+        height=0.170,
+        height_source="transparent_bottle_sparse_label_5frame_median",
+        yaw_rad=0.0,
+        quality={"reliable": True},
+        shape_kind="cylinder",
+        axis_xyz=(0.0, 0.0, 1.0),
+        diameter_m=0.060,
+        length_m=0.170,
         orientation_class="upright",
     )
 
@@ -227,6 +251,49 @@ def test_upright_cylinder_pipeline_fully_plans_horizontal_candidates(monkeypatch
     assert calls == {"ik": 10, "pose": 2, "cartesian": 4, "joints": 2}
 
 
+def test_transparent_bottle_pipeline_uses_eight_label_candidates(
+        monkeypatch):
+    from mcp_server.grasping import pipeline
+
+    calls = {"ik": 0, "pose": 0, "cartesian": 0, "joints": 0}
+
+    def solve(*_args, **_kwargs):
+        calls["ik"] += 1
+        return ComponentResult.success(
+            joints={f"joint{index}": 0.0 for index in range(1, 8)}
+        )
+
+    def planned(kind):
+        def call(*_args, **_kwargs):
+            calls[kind] += 1
+            return ComponentResult.success(plan=_plan())
+        return call
+
+    monkeypatch.setattr(pipeline.motion, "solve_pose_ik", solve)
+    monkeypatch.setattr(pipeline.motion, "plan_to_pose", planned("pose"))
+    monkeypatch.setattr(
+        pipeline.motion, "plan_cartesian", planned("cartesian")
+    )
+    monkeypatch.setattr(pipeline.motion, "plan_joints", planned("joints"))
+
+    result = plan_transparent_bottle_grasp(
+        _Bridge(), _transparent_bottle_geometry(),
+    )
+
+    assert result.ok
+    assert len(result.candidates) == 8
+    assert all(
+        candidate.source.startswith("transparent_bottle_upright_side_")
+        for candidate in result.candidates
+    )
+    assert all(
+        math.dist(candidate.pose_xyz, (-0.38, 0.02, 0.071))
+        == pytest.approx(0.020)
+        for candidate in result.candidates
+    )
+    assert calls == {"ik": 8, "pose": 2, "cartesian": 4, "joints": 2}
+
+
 def test_joint7_path_margin_checks_limit_but_allows_safe_observation_detour():
     def plan(points_deg, start_deg=None):
         points = [
@@ -256,6 +323,16 @@ def test_joint7_path_margin_checks_limit_but_allows_safe_observation_detour():
         plan([50.0, 45.0]),
         plan([45.0, 50.0]),
     )
+    stage_margins = _joint7_stage_margins_deg(
+        tuple(zip(("pregrasp", "approach", "retreat", "carry"), plans)),
+        85.0,
+    )
+    assert stage_margins == pytest.approx({
+        "pregrasp": 5.0,
+        "approach": 30.0,
+        "retreat": 35.0,
+        "carry": 35.0,
+    })
     assert _minimum_joint7_margin_deg(plans, 85.0) == pytest.approx(5.0)
     unsafe_retreat = plans[:2] + (plan([50.0, 65.0]), plans[3])
     assert _minimum_joint7_margin_deg(

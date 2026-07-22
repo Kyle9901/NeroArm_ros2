@@ -183,6 +183,36 @@ def test_second_full_plan_is_selected_when_first_complete_path_fails():
     assert result.evaluations[0].reason == "lift plan failed"
 
 
+def test_falls_back_to_next_preference_family_only_when_first_family_fails():
+    candidates = [
+        Candidate("table_90_a", _z_rotation(0.2), preference_rank=0),
+        Candidate("table_90_b", _z_rotation(0.3), preference_rank=0),
+        Candidate("table_60", _z_rotation(0.0), preference_rank=1),
+        Candidate("table_30", _z_rotation(0.1), preference_rank=2),
+    ]
+    full_calls = []
+
+    def full(candidate, _cheap, _timeout):
+        full_calls.append(candidate.candidate_id)
+        if candidate.preference_rank == 0:
+            return FullPlanResult(False, reason="preferred family blocked")
+        return FullPlanResult(True, plan=candidate.candidate_id)
+
+    result = CandidateEvaluator(
+        lambda _candidate, _timeout: CheapCheckResult(True, _joints()),
+        full,
+        full_plan_count=2,
+    ).evaluate(
+        candidates,
+        current_tcp_quat_xyzw=(0.0, 0.0, 0.0, 1.0),
+        current_joint_positions_rad=_joints(),
+    )
+
+    assert full_calls == ["table_90_a", "table_90_b", "table_60"]
+    assert result.selected.candidate_id == "table_60"
+    assert "table_30" not in full_calls
+
+
 def test_shape_first_prefers_horizontal_family_over_smaller_tcp_rotation():
     candidates = [
         Candidate(

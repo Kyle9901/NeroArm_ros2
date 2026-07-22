@@ -1,10 +1,13 @@
 robot_bridge_node:
   ros__parameters:
+    # Frames and calibrated TCP
     planning_group: arm
     tcp_link: tcp_link
     base_frame: base_link
     tcp_offset: [0.1733, 0.0, -0.0235, -1.5708, 0.0, -1.5708]
     grasp_quat: [0.00199997, 0.99999001, 0.00000184, 0.00399813]
+
+    # Workspace and fixed heights
     workspace_x_min: -0.55
     workspace_x_max: 0.25
     workspace_y_min: -0.55
@@ -12,10 +15,14 @@ robot_bridge_node:
     approach_height: 0.0867
     safe_height: 0.2267
     fingertip_depth: 0.04
+
+    # RGB-D perception: colored blocks
     block_depth_frames: 5
     block_depth_max_spread: 0.012
     block_xy_max_spread: 0.015
     block_yaw_max_spread_deg: 12.0
+
+    # RGB-D perception: opaque cylinders and cans
     cylinder_depth_frames: 5
     cylinder_depth_max_spread: 0.015
     cylinder_position_max_spread: 0.015
@@ -27,7 +34,32 @@ robot_bridge_node:
     cylinder_max_length_m: 0.30
     cylinder_side_grasp_height_ratio: 0.45
     cylinder_tilt_angles_deg: [0, 60, 90]
+
+    # RGB-D perception: current transparent water bottle profile
+    transparent_bottle_depth_frames: 5
+    transparent_bottle_max_capture_frames: 30
+    transparent_bottle_diameter_m: 0.060
+    transparent_bottle_height_m: 0.170
+    transparent_bottle_label_bottom_m: 0.056
+    transparent_bottle_label_height_m: 0.055
+    # Horizontal side grasps drive this far past the visually estimated bottle
+    # axis so the fingers engage the bottle body instead of touching it only
+    # at their tips.  This is intentionally smaller than the 30 mm radius.
+    transparent_bottle_upright_axis_overtravel_m: 0.020
+    transparent_bottle_min_height_m: 0.008
+    transparent_bottle_min_label_points: 25
+    transparent_bottle_tcp_max_spread_m: 0.010
+    transparent_bottle_upright_min_p90_m: 0.075
+    transparent_bottle_upright_min_p95_m: 0.095
+    transparent_bottle_lying_min_p90_m: 0.040
+    transparent_bottle_lying_min_p95_m: 0.045
+    transparent_bottle_lying_max_p90_m: 0.065
+    transparent_bottle_lying_max_p95_m: 0.080
+
+    # Perception safety checks
     desk_measurement_max_error: 0.05
+
+    # Grasp candidate generation and planning
     grasp_tilt_angles_deg: [0, 30, 60]
     grasp_pregrasp_distance: 0.08
     grasp_retreat_distance: 0.08
@@ -37,15 +69,22 @@ robot_bridge_node:
     joint7_min_margin_deg: 15.0
     planned_start_tolerance_rad: 0.02
     reverse_branch_tolerance_rad: 0.10
+
+    # Default placement and gripper
     place_x: -0.40
     place_y: -0.25
     place_z: 0.20
+    stack_clearance_m: 0.003
+    stack_max_overhang_m: 0.010
+    relative_placement_clearance_m: 0.020
+    placement_verify_xy_tolerance_m: 0.025
+    placement_verify_z_tolerance_m: 0.025
     gripper_open_width: 0.10
     gripper_close_width: 0.02
+
+    # Motion execution
     planning_time: 5.0
     num_planning_attempts: 2
-    octomap_enabled_on_prepare: false
-    desk_collision_enabled: true
     velocity_scaling: 0.5
     accel_scaling: 0.3
     descent_velocity_scaling: 0.2
@@ -55,7 +94,13 @@ robot_bridge_node:
     cartesian_jump_threshold: 2.0
     pos_tolerance: 0.01
     ori_tolerance: 0.10
-    observation_joints_deg: [0.0, -40.0, 0.0, 95.0, 0.0, 0.0, 80.0]
-    carry_joints_deg: [0.0, -20.0, 0.0, 80.0, 0.0, 0.0, 50.0]
+
+    # Planning scene
+    octomap_enabled_on_prepare: false
+    desk_collision_enabled: true
     desk_z_surface: -0.013
     desk_size: [2.0, 2.0, 0.02]
+
+    # Named joint poses
+    observation_joints_deg: [0.0, -66.0, 0.0, 120.0, 0.0, 0.0, 60.0]
+    carry_joints_deg: [0.0, -20.0, 0.0, 80.0, 0.0, 0.0, 50.0]

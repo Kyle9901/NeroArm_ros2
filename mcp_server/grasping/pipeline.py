@@ -13,6 +13,9 @@ import time
 from typing import Any, Iterable
 
 from .block_candidates import generate_block_grasp_candidates
+from .bottle_candidates import (
+    generate_transparent_bottle_grasp_candidates,
+)
 from .cylinder_candidates import generate_cylinder_grasp_candidates
 from .evaluator import (
     CandidateEvaluator,
@@ -150,6 +153,18 @@ def _joint7_path_limit_error(
     return None
 
 
+def _joint7_stage_margins_deg(
+    named_plans: Iterable[tuple[str, Any]],
+    limit_deg: float,
+) -> dict[str, float]:
+    """Return joint7 software-limit clearance for every planned stage."""
+
+    return {
+        str(name): _minimum_joint7_margin_deg((plan,), limit_deg)
+        for name, plan in named_plans
+    }
+
+
 def _geometry_ready(geometry: ObjectGeometry, object_kind: str) -> str | None:
     if geometry.center_xyz is None:
         return f"{object_kind} geometry has no center"
@@ -163,13 +178,13 @@ def _geometry_ready(geometry: ObjectGeometry, object_kind: str) -> str | None:
         return f"{object_kind} geometry dimensions must be positive"
     if object_kind == "block" and geometry.yaw_rad is None:
         return "block geometry has no planar yaw"
-    if object_kind == "cylinder":
+    if object_kind in {"cylinder", "transparent_bottle"}:
         if geometry.shape_kind != "cylinder":
-            return "cylinder geometry has the wrong shape kind"
+            return f"{object_kind} geometry has the wrong shape kind"
         if geometry.axis_xyz is None:
-            return "cylinder geometry has no axis"
+            return f"{object_kind} geometry has no axis"
         if geometry.diameter_m is None or geometry.length_m is None:
-            return "cylinder geometry has no diameter/length"
+            return f"{object_kind} geometry has no diameter/length"
         if (
             any(not math.isfinite(float(value)) for value in geometry.axis_xyz)
             or not math.isfinite(float(geometry.diameter_m))
@@ -177,14 +192,16 @@ def _geometry_ready(geometry: ObjectGeometry, object_kind: str) -> str | None:
             or float(geometry.diameter_m) <= 0.0
             or float(geometry.length_m) <= 0.0
         ):
-            return "cylinder geometry contains invalid axis/dimensions"
+            return f"{object_kind} geometry contains invalid axis/dimensions"
         if geometry.orientation_class not in {"upright", "lying"}:
-            return "cylinder geometry has no stable upright/lying class"
+            return (
+                f"{object_kind} geometry has no stable upright/lying class"
+            )
         if (
             geometry.local_desk_z is None
             or not math.isfinite(float(geometry.local_desk_z))
         ):
-            return "cylinder geometry has no local desk height"
+            return f"{object_kind} geometry has no local desk height"
     return None
 
 
@@ -260,6 +277,19 @@ def _plan_grasp(
             retreat_distance=bridge.get_grasp_retreat_distance(),
             tilt_angles_deg=bridge.get_cylinder_tilt_angles_deg(),
         )
+    elif object_kind == "transparent_bottle":
+        generated = generate_transparent_bottle_grasp_candidates(
+            geometry.center_xyz,
+            geometry.axis_xyz,
+            geometry.diameter_m,
+            geometry.orientation_class,
+            current_quat,
+            pregrasp_distance=bridge.get_grasp_pregrasp_distance(),
+            retreat_distance=bridge.get_grasp_retreat_distance(),
+            upright_axis_overtravel_m=(
+                bridge.get_transparent_bottle_upright_axis_overtravel_m()
+            ),
+        )
     else:
         return BlockGraspPlanning(
             None, None, (), f"unsupported grasp object kind: {object_kind}"
@@ -320,16 +350,21 @@ def _plan_grasp(
         )
 
     full_plan_count = bridge.get_grasp_full_plan_candidates()
-    full_calls = 0
+    full_calls_by_preference: dict[int, int] = {}
 
     def full_plan(
         candidate: GraspCandidate,
         _cheap: CheapCheckResult,
         remaining: float,
     ) -> FullPlanResult:
-        nonlocal full_calls
-        full_calls += 1
-        remaining_candidates = max(1, full_plan_count - full_calls + 1)
+        preference = int(getattr(candidate, "preference_rank", 0))
+        full_calls_by_preference[preference] = (
+            full_calls_by_preference.get(preference, 0) + 1
+        )
+        remaining_candidates = max(
+            1,
+            full_plan_count - full_calls_by_preference[preference] + 1,
+        )
         deadline = time.monotonic() + remaining / remaining_candidates
 
         def stage_timeout(stages_left: int) -> float:
@@ -379,19 +414,38 @@ def _plan_grasp(
         if not carry.ok:
             return FullPlanResult(False, reason=f"carry: {carry.error}")
         carry_plan = carry.data["plan"]
-        plans = (pregrasp_plan, approach_plan, retreat_plan, carry_plan)
-        joint7_limit = bridge.get_joint7_soft_limit_deg()
-        path_margin = _minimum_joint7_margin_deg(plans, joint7_limit)
-        path_error = _joint7_path_limit_error(
-            path_margin,
-            joint7_limit,
-            path_label="complete grasp path",
+        named_plans = (
+            ("pregrasp", pregrasp_plan),
+            ("approach", approach_plan),
+            ("retreat", retreat_plan),
+            ("carry", carry_plan),
         )
-        if path_error:
-            return FullPlanResult(
-                False,
-                reason=path_error,
+        plans = tuple(plan for _, plan in named_plans)
+        joint7_limit = bridge.get_joint7_soft_limit_deg()
+        stage_margins = _joint7_stage_margins_deg(
+            named_plans, joint7_limit,
+        )
+        stage_summary = ", ".join(
+            (
+                f"{name}={joint7_limit - margin:.1f}deg"
+                if math.isfinite(margin)
+                else f"{name}=missing"
             )
+            for name, margin in stage_margins.items()
+        )
+        print(
+            f"[grasp-plan] {candidate.source} joint7 max: "
+            f"{stage_summary}",
+            flush=True,
+        )
+        for stage_name, stage_margin in stage_margins.items():
+            path_error = _joint7_path_limit_error(
+                stage_margin,
+                joint7_limit,
+                path_label=f"{stage_name} stage",
+            )
+            if path_error:
+                return FullPlanResult(False, reason=path_error)
         total_motion = sum(_trajectory_motion_rad(plan) for plan in plans)
         path = PlannedGraspPath(
             candidate=candidate,
@@ -481,5 +535,21 @@ def plan_cylinder_grasp(
         bridge,
         geometry_value,
         object_kind="cylinder",
+        excluded_candidate_ids=excluded_candidate_ids,
+    )
+
+
+def plan_transparent_bottle_grasp(
+    bridge,
+    geometry_value: ObjectGeometry | dict,
+    *,
+    excluded_candidate_ids: Iterable[str] = (),
+) -> BlockGraspPlanning:
+    """Plan only the measured-label strategy for the transparent bottle."""
+
+    return _plan_grasp(
+        bridge,
+        geometry_value,
+        object_kind="transparent_bottle",
         excluded_candidate_ids=excluded_candidate_ids,
     )

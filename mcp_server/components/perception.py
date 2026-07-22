@@ -17,6 +17,9 @@ from ..perception.color_detector import (
 )
 from ..perception.cylinder_geometry import fit_cylinder_geometry
 from ..perception.debug import draw_bboxes
+from ..perception.transparent_bottle import (
+    analyze_transparent_bottle_points,
+)
 
 if TYPE_CHECKING:
     from ..ros_bridge import RobotBridge
@@ -1113,6 +1116,497 @@ def _save_cylinder_depth_debug(
                 pass
     cv2.imwrite(str(path), combined)
     return str(path)
+
+
+def _save_transparent_bottle_debug(
+    color_img,
+    depth_img,
+    bbox: list[int],
+    sample_u,
+    sample_v,
+    heights_m,
+    desk_fit: dict,
+    analysis,
+) -> dict[str, str]:
+    """Save the latest sparse bottle pose and height diagnostics."""
+
+    import cv2
+    import numpy as np
+    from pathlib import Path
+
+    color = np.asarray(color_img).copy()
+    depth = np.asarray(depth_img)
+    u = np.asarray(sample_u, dtype=np.int32)
+    v = np.asarray(sample_v, dtype=np.int32)
+    heights = np.asarray(heights_m, dtype=np.float64)
+    xmin, ymin, xmax, ymax = [int(value) for value in bbox]
+
+    def paint_points(image, mask, bgr, radius=1):
+        indices = np.flatnonzero(np.asarray(mask, dtype=bool))
+        for index in indices:
+            cv2.circle(
+                image,
+                (int(u[index]), int(v[index])),
+                radius,
+                bgr,
+                -1,
+                cv2.LINE_AA,
+            )
+
+    pose = color.copy()
+    pose[:] = (pose.astype(np.float32) * 0.72).astype(np.uint8)
+    cv2.rectangle(pose, (xmin, ymin), (xmax, ymax), (0, 255, 255), 2)
+
+    desk_inliers = np.asarray(desk_fit.get("inliers", ()), dtype=bool)
+    desk_u = np.asarray(desk_fit.get("sample_u", ()), dtype=np.int32)
+    desk_v = np.asarray(desk_fit.get("sample_v", ()), dtype=np.int32)
+    if len(desk_inliers) == len(desk_u):
+        visible_desk_u = desk_u[desk_inliers]
+        visible_desk_v = desk_v[desk_inliers]
+        if len(visible_desk_u) > 800:
+            visible_indices = np.linspace(
+                0, len(visible_desk_u) - 1, 800, dtype=int,
+            )
+            visible_desk_u = visible_desk_u[visible_indices]
+            visible_desk_v = visible_desk_v[visible_indices]
+        for du, dv in zip(visible_desk_u, visible_desk_v):
+            cv2.circle(pose, (int(du), int(dv)), 1, (255, 128, 0), -1)
+
+    paint_points(pose, analysis.reliable_mask, (0, 165, 255), 1)
+    paint_points(pose, analysis.label_mask, (0, 255, 0), 2)
+    paint_points(pose, analysis.cap_mask, (255, 0, 255), 2)
+
+    center = np.asarray(analysis.image_axis_center_uv, dtype=np.float64)
+    axis = np.asarray(analysis.image_axis_uv, dtype=np.float64)
+    perpendicular = np.asarray([-axis[1], axis[0]])
+    minor_span = max(20.0, min(xmax - xmin, ymax - ymin) * 0.65)
+    for side in (-1.0, 1.0):
+        boundary_center = (
+            center + axis * analysis.label_axis_half_span_px * side
+        )
+        start = boundary_center - perpendicular * minor_span
+        end = boundary_center + perpendicular * minor_span
+        cv2.line(
+            pose,
+            tuple(np.rint(start).astype(int)),
+            tuple(np.rint(end).astype(int)),
+            (0, 255, 0),
+            1,
+            cv2.LINE_AA,
+        )
+
+    label_pixels = np.column_stack((u, v))[analysis.label_mask]
+    label_pixel = np.rint(np.median(label_pixels, axis=0)).astype(int)
+    cv2.drawMarker(
+        pose,
+        tuple(label_pixel),
+        (255, 255, 255),
+        cv2.MARKER_CROSS,
+        16,
+        2,
+    )
+    if analysis.orientation == "lying":
+        arrow_end = (
+            label_pixel.astype(np.float64)
+            + perpendicular * max(28.0, minor_span * 0.7)
+        )
+        cv2.arrowedLine(
+            pose,
+            tuple(label_pixel),
+            tuple(np.rint(arrow_end).astype(int)),
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+            tipLength=0.25,
+        )
+    text_lines = (
+        f"pose={analysis.orientation}",
+        (
+            f"p90={analysis.height_p90_m * 1000:.1f}mm "
+            f"p95={analysis.height_p95_m * 1000:.1f}mm"
+        ),
+        (
+            f"support={analysis.reliable_count} "
+            f"label={analysis.label_count} "
+            f"connected={analysis.connected_ratio:.0%}"
+        ),
+        (
+            f"tcp=({analysis.tcp_xyz[0]:.3f},"
+            f"{analysis.tcp_xyz[1]:.3f},"
+            f"{analysis.tcp_xyz[2]:.3f})"
+        ),
+    )
+    cv2.rectangle(pose, (0, 0), (pose.shape[1], 80), (0, 0, 0), -1)
+    for index, text in enumerate(text_lines):
+        cv2.putText(
+            pose,
+            text,
+            (8, 17 + index * 19),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.46,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+    height_view = color.copy()
+    height_view[:] = (height_view.astype(np.float32) * 0.30).astype(np.uint8)
+    reliable_indices = np.flatnonzero(analysis.reliable_mask)
+    reliable_heights = heights[analysis.reliable_mask]
+    if len(reliable_heights):
+        maximum = max(float(np.quantile(reliable_heights, 0.98)), 0.001)
+        normalized = np.clip(
+            reliable_heights / maximum * 255.0, 0.0, 255.0,
+        ).astype(np.uint8)
+        colors = cv2.applyColorMap(
+            normalized.reshape(-1, 1), cv2.COLORMAP_TURBO,
+        ).reshape(-1, 3)
+        for index, bgr in zip(reliable_indices, colors):
+            cv2.circle(
+                height_view,
+                (int(u[index]), int(v[index])),
+                2,
+                tuple(int(value) for value in bgr),
+                -1,
+            )
+    cv2.rectangle(
+        height_view, (xmin, ymin), (xmax, ymax), (255, 255, 255), 2,
+    )
+    cv2.rectangle(
+        height_view, (0, 0), (height_view.shape[1], 42), (0, 0, 0), -1,
+    )
+    cv2.putText(
+        height_view,
+        "height above local desk: blue=low red=high",
+        (8, 18),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        height_view,
+        (
+            f"p90={analysis.height_p90_m * 1000:.1f}mm "
+            f"p95={analysis.height_p95_m * 1000:.1f}mm"
+        ),
+        (8, 37),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+
+    debug_dir = Path(_DEBUG_DIR)
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "pose": debug_dir / "bottle_pose_latest.png",
+        "height": debug_dir / "bottle_height_latest.png",
+    }
+    cv2.imwrite(str(paths["pose"]), pose)
+    cv2.imwrite(str(paths["height"]), height_view)
+    return {name: str(path) for name, path in paths.items()}
+
+
+def transparent_bottle_detection_to_3d(
+    bridge: "RobotBridge",
+    frame: ImageFrame,
+    detection: dict,
+) -> ComponentResult:
+    """Measure the current transparent bottle from sparse real depth only."""
+
+    import numpy as np
+
+    bbox = detection.get("bbox")
+    if not bbox or len(bbox) != 4:
+        return ComponentResult.failure(
+            "Transparent bottle detection has no valid bbox"
+        )
+    depth_img = frame.depth
+    image_height, image_width = depth_img.shape[:2]
+    xmin, ymin, xmax, ymax = [
+        int(round(float(value))) for value in bbox
+    ]
+    xmin, xmax = max(0, xmin), min(image_width - 1, xmax)
+    ymin, ymax = max(0, ymin), min(image_height - 1, ymax)
+    if xmax <= xmin or ymax <= ymin:
+        return ComponentResult.failure(
+            "Transparent bottle detection bbox is empty"
+        )
+
+    camera_info = bridge.node.get_color_info()
+    if camera_info is None:
+        return ComponentResult.failure(
+            "Color camera intrinsics are unavailable"
+        )
+    desk_fit = _fit_local_desk_plane(
+        depth_img,
+        [xmin, ymin, xmax, ymax],
+        None,
+        camera_info,
+    )
+    if desk_fit is None:
+        return ComponentResult.failure(
+            "Unable to fit a metric local desk plane around transparent bottle"
+        )
+
+    roi_valid = np.zeros(depth_img.shape[:2], dtype=bool)
+    roi_valid[ymin:ymax + 1, xmin:xmax + 1] = True
+    roi_valid &= depth_img > 0
+    vv, uu = np.nonzero(roi_valid)
+    depths_mm = depth_img[roi_valid].astype(np.float64)
+    if len(depths_mm) < 30:
+        return ComponentResult.failure(
+            f"Only {len(depths_mm)} valid depth samples inside bottle bbox"
+        )
+
+    points_camera = _deproject_samples(
+        uu, vv, depths_mm, camera_info,
+    )
+    desk_normal = np.asarray(desk_fit["normal"], dtype=np.float64)
+    desk_offset = float(desk_fit["offset"])
+    signed_heights = points_camera @ desk_normal + desk_offset
+    # Most bbox pixels may see through the bottle to the desk, so the median
+    # can be close to zero. Orient the plane from camera geometry instead of
+    # relying on the sign of object samples.
+    if desk_normal[2] > 0.0:
+        desk_normal *= -1.0
+        desk_offset *= -1.0
+        signed_heights *= -1.0
+
+    try:
+        rigid_transform = _camera_to_base_rigid_transform(bridge, frame)
+        points_base = _transform_camera_points_to_base(
+            bridge,
+            frame,
+            points_camera,
+            rigid_transform=rigid_transform,
+        )
+    except Exception as error:
+        return ComponentResult.failure(
+            f"Unable to transform transparent bottle points to base_link: {error}"
+        )
+
+    origin, rotation = rigid_transform
+    normal_base_raw = rotation @ desk_normal
+    normal_norm = float(np.linalg.norm(normal_base_raw))
+    if normal_norm <= 1e-9:
+        return ComponentResult.failure(
+            "Transformed bottle desk normal is degenerate"
+        )
+    normal_base = normal_base_raw / normal_norm
+    desk_offset_base = (
+        desk_offset - float(normal_base_raw @ origin)
+    ) / normal_norm
+    if normal_base[2] < 0.0:
+        normal_base *= -1.0
+        desk_offset_base *= -1.0
+        signed_heights *= -1.0
+    if normal_base[2] <= 0.90:
+        return ComponentResult.failure(
+            "Fitted bottle desk normal is not aligned with base +Z"
+        )
+
+    profile = bridge.get_transparent_bottle_profile()
+    provisional = (
+        (signed_heights >= profile["transparent_bottle_min_height_m"])
+        & (
+            signed_heights
+            <= profile["transparent_bottle_height_m"] + 0.03
+        )
+    )
+    if int(np.count_nonzero(provisional)) < int(
+        profile["transparent_bottle_min_label_points"]
+    ):
+        return ComponentResult.failure(
+            "Bottle bbox has too few reliable points above the local desk",
+            valid_depth_points=int(np.count_nonzero(provisional)),
+        )
+    provisional_xy = np.median(points_base[provisional, :2], axis=0)
+    local_desk_z = -(
+        normal_base[0] * provisional_xy[0]
+        + normal_base[1] * provisional_xy[1]
+        + desk_offset_base
+    ) / normal_base[2]
+    desk_error = abs(
+        float(local_desk_z) - float(bridge.get_desk_surface_z())
+    )
+    if desk_error > bridge.get_desk_measurement_max_error():
+        return ComponentResult.failure(
+            f"Measured desk z differs from configured desk by "
+            f"{desk_error:.4f}m "
+            f"(limit {bridge.get_desk_measurement_max_error():.4f}m)"
+        )
+
+    try:
+        analysis = analyze_transparent_bottle_points(
+            np.column_stack((uu, vv)),
+            depths_mm,
+            points_base,
+            signed_heights,
+            local_desk_z=float(local_desk_z),
+            minimum_height_m=float(
+                profile["transparent_bottle_min_height_m"]
+            ),
+            maximum_height_m=float(
+                profile["transparent_bottle_height_m"] + 0.03
+            ),
+            label_axis_fraction=float(
+                profile["transparent_bottle_label_height_m"]
+                / profile["transparent_bottle_height_m"]
+            ),
+            minimum_label_points=int(
+                profile["transparent_bottle_min_label_points"]
+            ),
+            upright_min_p90_m=float(
+                profile["transparent_bottle_upright_min_p90_m"]
+            ),
+            upright_min_p95_m=float(
+                profile["transparent_bottle_upright_min_p95_m"]
+            ),
+            lying_min_p90_m=float(
+                profile["transparent_bottle_lying_min_p90_m"]
+            ),
+            lying_min_p95_m=float(
+                profile["transparent_bottle_lying_min_p95_m"]
+            ),
+            lying_max_p90_m=float(
+                profile["transparent_bottle_lying_max_p90_m"]
+            ),
+            lying_max_p95_m=float(
+                profile["transparent_bottle_lying_max_p95_m"]
+            ),
+        )
+    except ValueError as error:
+        return ComponentResult.failure(
+            f"Transparent bottle sparse depth rejected: {error}"
+        )
+
+    if analysis.orientation in {"upright", "lying"}:
+        center_2d = detection.get("center_2d")
+        if not center_2d or len(center_2d) != 2:
+            center_2d = [
+                (xmin + xmax) * 0.5,
+                (ymin + ymax) * 0.5,
+            ]
+        center_u, center_v = [float(value) for value in center_2d]
+        ray_camera = np.asarray([
+            (center_u - float(camera_info["cx"]))
+            / float(camera_info["fx"]),
+            (center_v - float(camera_info["cy"]))
+            / float(camera_info["fy"]),
+            1.0,
+        ])
+        ray_base = rotation @ ray_camera
+        if abs(float(ray_base[2])) <= 1e-9:
+            return ComponentResult.failure(
+                "YOLO bbox center ray is parallel to the label-height plane"
+            )
+        target_plane_z = (
+            float(analysis.label_surface_xyz[2])
+            if analysis.orientation == "upright"
+            else float(analysis.tcp_xyz[2])
+        )
+        scale = (target_plane_z - float(origin[2])) / float(ray_base[2])
+        if scale <= 0.0:
+            return ComponentResult.failure(
+                "YOLO bbox center ray intersects behind the camera"
+            )
+        axis_point = origin + ray_base * scale
+        analysis = replace(
+            analysis,
+            cap_or_axis_xy=(
+                float(axis_point[0]),
+                float(axis_point[1]),
+            ),
+            tcp_xyz=(
+                float(axis_point[0]),
+                float(axis_point[1]),
+                target_plane_z,
+            ),
+        )
+
+    measured_surface_height = (
+        float(analysis.height_p90_m)
+        if analysis.orientation == "lying"
+        else float(analysis.label_surface_xyz[2]) - float(local_desk_z)
+    )
+    configured_desk_z = float(bridge.get_desk_surface_z())
+    if analysis.orientation == "upright":
+        anchored_tcp_z = configured_desk_z + measured_surface_height
+    else:
+        anchored_tcp_z = (
+            configured_desk_z + measured_surface_height * 0.5
+        )
+    analysis = replace(
+        analysis,
+        tcp_xyz=(
+            float(analysis.tcp_xyz[0]),
+            float(analysis.tcp_xyz[1]),
+            float(anchored_tcp_z),
+        ),
+    )
+
+    try:
+        debug_paths = _save_transparent_bottle_debug(
+            frame.color,
+            depth_img,
+            [xmin, ymin, xmax, ymax],
+            uu,
+            vv,
+            signed_heights,
+            desk_fit,
+            analysis,
+        )
+    except Exception:
+        debug_paths = {}
+
+    return ComponentResult.success(
+        x=analysis.tcp_xyz[0],
+        y=analysis.tcp_xyz[1],
+        z=analysis.tcp_xyz[2],
+        frame_id="base_link",
+        orientation=analysis.orientation,
+        height_p90_m=analysis.height_p90_m,
+        height_p95_m=analysis.height_p95_m,
+        local_desk_z=float(local_desk_z),
+        configured_desk_z=configured_desk_z,
+        measured_surface_height_m=measured_surface_height,
+        label_surface_xyz=list(analysis.label_surface_xyz),
+        cap_or_axis_xy=list(analysis.cap_or_axis_xy),
+        horizontal_axis_xy=list(analysis.horizontal_axis_xy),
+        horizontal_span_m=analysis.horizontal_span_m,
+        tcp_xyz=list(analysis.tcp_xyz),
+        valid_depth_points=analysis.reliable_count,
+        label_depth_points=analysis.label_count,
+        label_connected_ratio=analysis.connected_ratio,
+        reliable_heights_m=[
+            float(value)
+            for value in signed_heights[analysis.reliable_mask]
+        ],
+        method="transparent_bottle_sparse_label_depth",
+        depth_is_estimated=False,
+        geometry_quality={
+            "reliable": analysis.orientation in {"upright", "lying"},
+            "orientation": analysis.orientation,
+            "horizontal_span_m": analysis.horizontal_span_m,
+            "height_p90_m": analysis.height_p90_m,
+            "height_p95_m": analysis.height_p95_m,
+            "reliable_depth_points": analysis.reliable_count,
+            "label_depth_points": analysis.label_count,
+            "label_connected_ratio": analysis.connected_ratio,
+            "desk_inliers": int(desk_fit["inlier_count"]),
+            "desk_samples": int(desk_fit["sample_count"]),
+            "desk_residual_median_mm": float(
+                desk_fit["residual_median_mm"]
+            ),
+            "configured_desk_error_m": float(desk_error),
+        },
+        debug_image=debug_paths.get("pose"),
+        height_debug_image=debug_paths.get("height"),
+    )
 
 
 def cylinder_detection_to_3d(

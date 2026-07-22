@@ -45,6 +45,7 @@ TOOL_DEFINITIONS = [
             "Just describe the task naturally. Examples:\n"
             "- '把蓝色方块放到右边'\n"
             "- '直接抓黄色方块'\n"
+            "- '抓取水瓶'\n"
             "- '扫描桌面'\n"
             "- 'pick the red block and place it on the left'\n\n"
             "OPTIONAL: provide target (object description) and place (location word) to override LLM extraction.\n"
@@ -83,8 +84,8 @@ TOOL_DEFINITIONS = [
             "Prepare the robot system for task execution. Starts or checks arm, camera, hand-eye TF, "
             "MoveIt planning scene, and the configured desk collision box. "
             "Point-cloud filtering and OctoMap remain optional and disabled by default. "
-            "Call this once at the start of a session before arm_execute_task. "
-            "If everything is already ready, it returns immediately."
+            "arm_execute_task already runs this preparation internally, so normally call the task directly. "
+            "Use arm_prepare for an explicit preflight check. If everything is already ready, it returns immediately."
         ),
         "inputSchema": {
             "type": "object",
@@ -99,7 +100,9 @@ TOOL_DEFINITIONS = [
         "name": "arm_get_status",
         "description": (
             "Get the current robot status: joint angles, gripper state, holding state, workspace bounds, "
-            "safe height, desk surface Z, and grasp geometry parameters."
+            "safe height, desk surface Z, and grasp geometry parameters. RGB-D capture is on demand: "
+            "pair_age_s describes the last cached frame and may grow while idle; it is diagnostic and "
+            "does not require arm_prepare. Each task captures and validates a fresh pair before perception."
         ),
         "inputSchema": {"type": "object", "properties": {}, "required": []},
     },

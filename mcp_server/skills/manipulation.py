@@ -12,6 +12,7 @@ from ..grasping import (
     PlannedGraspPath,
     plan_block_grasp,
     plan_cylinder_grasp,
+    plan_transparent_bottle_grasp,
 )
 from ..grasping.pipeline import (
     _joint7_path_limit_error,
@@ -21,6 +22,7 @@ from ..models import GraspCandidate
 from ..object_types import (
     is_block_target,
     is_cylinder_target,
+    is_transparent_bottle_target,
 )
 
 if TYPE_CHECKING:
@@ -274,15 +276,31 @@ def _grasp_candidate_shape(
         )
     path = planning.selected_path
     candidate = path.candidate
+    endpoint_detail = ""
+    if (
+        object_kind == "transparent_bottle"
+        and geometry.get("orientation_class") == "upright"
+    ):
+        # x/y/z are the already validated perception output passed by the
+        # orchestrator.  Do not reach into ObjectGeometry's serialized dict
+        # here (its public field is ``center``, not the internal center_xyz).
+        visual_axis = (float(x), float(y), float(z))
+        overtravel = math.dist(visual_axis, candidate.pose_xyz)
+        endpoint_detail = (
+            f", visual_axis=({visual_axis[0]:.4f},"
+            f"{visual_axis[1]:.4f},{visual_axis[2]:.4f}), "
+            f"axis_overtravel={overtravel:.3f}m"
+        )
     print(
         f"[grasp] kind={object_kind}, selected={candidate.candidate_id}, "
-        f"tilt={candidate.tilt_deg:.0f}deg, "
+        f"angle_from_table={90.0 - candidate.tilt_deg:.0f}deg "
+        f"(tilt_from_vertical={candidate.tilt_deg:.0f}deg), "
         f"pose=({candidate.pose_xyz[0]:.4f},"
         f"{candidate.pose_xyz[1]:.4f},{candidate.pose_xyz[2]:.4f}), "
         f"width={candidate.gripper_width:.3f}, "
         f"evaluated={planning.batch.cheap_checks}, "
         f"full_plans={planning.batch.full_plans}, "
-        f"time={planning.batch.elapsed_s:.2f}s",
+        f"time={planning.batch.elapsed_s:.2f}s{endpoint_detail}",
         flush=True,
     )
 
@@ -336,6 +354,32 @@ def _grasp_candidate_shape(
             motion_state_unknown=unknown,
             selected_candidate=candidate.to_dict(),
         )
+
+    if (
+        object_kind == "transparent_bottle"
+        and geometry.get("orientation_class") == "upright"
+    ):
+        # Execution success means the controller accepted the trajectory.
+        # Record the measured TCP before closing so a geometric miss can be
+        # distinguished from tracking or TCP-frame errors on the next run.
+        try:
+            reached = bridge.get_current_tcp_pose(timeout=1.0)["position"]
+            endpoint_error = math.dist(
+                tuple(float(value) for value in reached),
+                candidate.pose_xyz,
+            )
+            print(
+                f"[grasp] reached_tcp=({reached[0]:.4f},{reached[1]:.4f},"
+                f"{reached[2]:.4f}), "
+                f"endpoint_error={endpoint_error * 1000.0:.1f}mm",
+                flush=True,
+            )
+        except Exception as error:
+            print(
+                f"[grasp] WARNING: cannot verify reached TCP before close: "
+                f"{error}",
+                flush=True,
+            )
 
     closed = motion.control_gripper(bridge, geo.gripper_close, duration=2.0)
     if not closed.ok:
@@ -465,6 +509,26 @@ def _grasp_cylinder(
         geo,
         planner=plan_cylinder_grasp,
         object_kind="cylinder",
+    )
+
+
+def _grasp_transparent_bottle(
+    bridge: "RobotBridge",
+    x: float,
+    y: float,
+    z: float,
+    geometry: dict,
+    geo: GraspGeometry,
+) -> SkillResult:
+    return _grasp_candidate_shape(
+        bridge,
+        x,
+        y,
+        z,
+        geometry,
+        geo,
+        planner=plan_transparent_bottle_grasp,
+        object_kind="transparent_bottle",
     )
 
 
@@ -632,6 +696,18 @@ def grasp_object(bridge: "RobotBridge", x: float, y: float, z: float,
                 holding=False,
             )
         return _grasp_block(bridge, x, y, z, geometry, geo)
+    if is_transparent_bottle_target(target):
+        if not geometry:
+            return _fail(
+                "transparent bottle grasp requires stable measured-label "
+                "geometry",
+                "candidate_geometry",
+                retryable=False,
+                holding=False,
+            )
+        return _grasp_transparent_bottle(
+            bridge, x, y, z, geometry, geo,
+        )
     if _is_cylinder_target(target):
         if not geometry:
             return _fail(
@@ -983,9 +1059,180 @@ def _place_legacy(bridge: "RobotBridge", x: float, y: float, z: float,
     )
 
 
+def _plan_translated_candidate_place(
+    bridge: "RobotBridge",
+    candidate: GraspCandidate,
+    timeout: float,
+):
+    """Plan preplace, approach, and post-release retreat before execution."""
+    started = time.monotonic()
+
+    def remaining(stages: int) -> float:
+        available = timeout - (time.monotonic() - started)
+        return max(0.01, available / max(1, stages))
+
+    quaternion = list(candidate.pose_quat_xyzw)
+    preplace = motion.plan_to_pose(
+        bridge,
+        *candidate.pregrasp_xyz,
+        quaternion,
+        timeout=remaining(3),
+    )
+    if not preplace.ok:
+        return None, f"preplace: {preplace.error}"
+    preplace_plan = preplace.data["plan"]
+    approach = motion.plan_cartesian(
+        bridge,
+        *candidate.pose_xyz,
+        quaternion,
+        timeout=remaining(2),
+        start_state=preplace_plan.end_state,
+    )
+    if not approach.ok:
+        return None, f"place approach: {approach.error}"
+    approach_plan = approach.data["plan"]
+    retreat = motion.plan_cartesian(
+        bridge,
+        *candidate.pregrasp_xyz,
+        quaternion,
+        timeout=remaining(1),
+        start_state=approach_plan.end_state,
+    )
+    if not retreat.ok:
+        return None, f"post-release retreat: {retreat.error}"
+    retreat_plan = retreat.data["plan"]
+    joint7_limit = bridge.get_joint7_soft_limit_deg()
+    margin = _minimum_joint7_margin_deg(
+        (preplace_plan, approach_plan, retreat_plan),
+        joint7_limit,
+    )
+    limit_error = _joint7_path_limit_error(
+        margin,
+        joint7_limit,
+        path_label="translated place path",
+    )
+    if limit_error:
+        return None, limit_error
+    return (preplace_plan, approach_plan, retreat_plan), None
+
+
+def _place_translated_candidate(
+    bridge: "RobotBridge",
+    candidate_value: dict,
+    x: float,
+    y: float,
+    z: float,
+) -> SkillResult:
+    try:
+        candidate = GraspCandidate.from_dict(candidate_value)
+    except (KeyError, TypeError, ValueError) as exc:
+        return _fail(
+            f"invalid placement candidate: {exc}",
+            "placement_candidate_validation",
+            retryable=False,
+            holding=True,
+        )
+    if candidate.pose_xyz[2] <= bridge.get_desk_surface_z():
+        return _fail(
+            "placement candidate TCP is at or below the desk",
+            "placement_candidate_validation",
+            retryable=False,
+            holding=True,
+        )
+    for point_name, point in (
+        ("placement", candidate.pose_xyz),
+        ("preplacement", candidate.pregrasp_xyz),
+    ):
+        workspace = motion.workspace_check(bridge, point[0], point[1])
+        if not workspace.ok:
+            return _fail(
+                workspace.error or f"{point_name} leaves workspace",
+                "workspace_check",
+                retryable=False,
+                holding=True,
+            )
+
+    plans, error = _plan_translated_candidate_place(
+        bridge,
+        candidate,
+        bridge.get_grasp_candidate_timeout(),
+    )
+    if plans is None:
+        return _fail(
+            error or "translated place planning failed",
+            "translated_place_planning",
+            retryable=False,
+            holding=True,
+        )
+    preplace_plan, approach_plan, retreat_plan = plans
+    for step, plan in (
+        ("move_to_preplace", preplace_plan),
+        ("place_approach", approach_plan),
+    ):
+        result = motion.execute_planned(bridge, plan)
+        if not result.ok:
+            unknown = _motion_state_unknown(result)
+            recovered = False if unknown else motion.go_carry(bridge).ok
+            return _fail(
+                result.error or f"{step} failed",
+                step,
+                recovered=recovered,
+                retryable=False,
+                holding=True,
+                motion_state_unknown=unknown,
+            )
+
+    opened = motion.control_gripper(
+        bridge,
+        GraspGeometry.from_bridge(bridge).gripper_open,
+    )
+    if not opened.ok:
+        if opened.data.get("stop_requested"):
+            bridge.set_holding(True)
+            return _fail(
+                opened.error or "task stopped before object release",
+                "task_stop",
+                retryable=False,
+                holding=True,
+                stop_requested=True,
+            )
+        retreat = motion.execute_planned(bridge, retreat_plan)
+        bridge.set_holding(None)
+        return _fail(
+            opened.error or "release result is uncertain",
+            "open_gripper",
+            recovered=retreat.ok,
+            retryable=False,
+            holding=None,
+        )
+
+    bridge.set_holding(False)
+    retreat = motion.execute_planned(bridge, retreat_plan)
+    if not retreat.ok:
+        unknown = _motion_state_unknown(retreat)
+        recovered = False if unknown else motion.go_home(bridge).ok
+        return _fail(
+            retreat.error or "post-release retreat failed",
+            "place_retreat",
+            recovered=recovered,
+            retryable=False,
+            holding=False,
+            motion_state_unknown=unknown,
+        )
+    return SkillResult.success(
+        holding=False,
+        state="empty",
+        place_x=x,
+        place_y=y,
+        place_z=z,
+        placement_candidate=candidate.to_dict(),
+    )
+
+
 def place_object(bridge: "RobotBridge", x: float, y: float, z: float,
                  quat: list[float] | None = None,
-                 reverse_candidate: dict | None = None) -> SkillResult:
+                 reverse_candidate: dict | None = None,
+                 placement_candidate: dict | None = None) -> SkillResult:
     """Reverse a selected shape-specific grasp path at the original pose."""
     holding = bridge.get_holding()
     if holding is not True:
@@ -998,4 +1245,12 @@ def place_object(bridge: "RobotBridge", x: float, y: float, z: float,
         )
     if reverse_candidate is not None:
         return _place_reverse(bridge, reverse_candidate, x, y, z)
+    if placement_candidate is not None:
+        return _place_translated_candidate(
+            bridge,
+            placement_candidate,
+            x,
+            y,
+            z,
+        )
     return _place_legacy(bridge, x, y, z, quat)

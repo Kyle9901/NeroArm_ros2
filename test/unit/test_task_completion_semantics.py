@@ -82,6 +82,28 @@ def test_cleanup_returns_to_observation_after_release(monkeypatch):
     assert "观察位" in result["messages"][-1]
 
 
+def test_cleanup_does_not_repeat_home_after_post_place_observation(monkeypatch):
+    bridge = _Bridge(False)
+
+    def _unexpected_home(_bridge):
+        bridge.home_calls += 1
+        return ComponentResult.success()
+
+    monkeypatch.setattr(graph_module.motion, "go_home", _unexpected_home)
+    result = graph_module._make_cleanup_node(bridge)({
+        "messages": [],
+        "pipeline": [
+            {"skill": "place_object"},
+            {"skill": "go_home"},
+            {"skill": "locate_object"},
+            {"skill": "verify_placement"},
+        ],
+    })
+
+    assert bridge.home_calls == 0
+    assert "已在观察位" in result["messages"][-1]
+
+
 def test_cleanup_reports_failure_when_observation_pose_is_not_reached(monkeypatch):
     bridge = _Bridge(False)
     monkeypatch.setattr(

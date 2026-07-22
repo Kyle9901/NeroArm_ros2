@@ -16,6 +16,7 @@ class _Bridge:
     def __init__(self, *, desk_ok=True):
         self.node = _Node(desk_ok)
         self.octomap_calls = []
+        self.health_freshness_requests = []
 
     def get_octomap_enabled_on_prepare(self):
         return False
@@ -30,7 +31,8 @@ class _Bridge:
     def get_desk_collision_enabled(self):
         return True
 
-    def health_status(self):
+    def health_status(self, *, require_fresh_camera=True):
+        self.health_freshness_requests.append(require_fresh_camera)
         return {"ready": True, "failures": [], "camera": {}}
 
 
@@ -61,6 +63,7 @@ def test_prepare_defaults_octomap_off_and_adds_only_desk(monkeypatch):
     assert result.ok
     assert bridge.octomap_calls == [False]
     assert bridge.node.desk_calls == 1
+    assert bridge.health_freshness_requests == [True]
 
 
 def test_prepare_desk_failure_is_a_safety_failure_before_capture(monkeypatch):

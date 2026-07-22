@@ -35,6 +35,9 @@ def get_status(bridge: "RobotBridge") -> dict:
             "cylinder_side_grasp_height_ratio": (
                 bridge.get_cylinder_side_grasp_height_ratio()
             ),
+            "transparent_bottle_upright_axis_overtravel_m": (
+                bridge.get_transparent_bottle_upright_axis_overtravel_m()
+            ),
             "cylinder_diameter_range_m": [
                 bridge.get_cylinder_min_diameter_m(),
                 bridge.get_cylinder_max_diameter_m(),
@@ -51,7 +54,10 @@ def get_status(bridge: "RobotBridge") -> dict:
         },
         "observation_joints_deg": bridge.get_observation_joints_deg(),
         "carry_joints_deg": bridge.get_carry_joints_deg(),
-        "health": bridge.health_status(),
+        # RGB-D subscriptions are on demand.  An old cached pair is useful
+        # diagnostic data but must not make an otherwise ready idle MCP look
+        # broken; prepare performs the strict fresh-capture gate.
+        "health": bridge.health_status(require_fresh_camera=False),
     }
 
 

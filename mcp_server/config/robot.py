@@ -20,12 +20,30 @@ _REQUIRED = {
     "cylinder_min_diameter_m", "cylinder_max_diameter_m",
     "cylinder_min_length_m", "cylinder_max_length_m",
     "cylinder_side_grasp_height_ratio", "cylinder_tilt_angles_deg",
+    "transparent_bottle_depth_frames",
+    "transparent_bottle_max_capture_frames",
+    "transparent_bottle_diameter_m",
+    "transparent_bottle_height_m", "transparent_bottle_label_bottom_m",
+    "transparent_bottle_label_height_m",
+    "transparent_bottle_upright_axis_overtravel_m",
+    "transparent_bottle_min_height_m",
+    "transparent_bottle_min_label_points",
+    "transparent_bottle_tcp_max_spread_m",
+    "transparent_bottle_upright_min_p90_m",
+    "transparent_bottle_upright_min_p95_m",
+    "transparent_bottle_lying_min_p90_m",
+    "transparent_bottle_lying_min_p95_m",
+    "transparent_bottle_lying_max_p90_m",
+    "transparent_bottle_lying_max_p95_m",
     "grasp_tilt_angles_deg",
     "grasp_pregrasp_distance", "grasp_retreat_distance",
     "grasp_candidate_timeout", "grasp_full_plan_candidates",
     "joint7_soft_limit_deg", "joint7_min_margin_deg",
     "planned_start_tolerance_rad", "reverse_branch_tolerance_rad",
     "place_x", "place_y", "place_z",
+    "stack_clearance_m", "stack_max_overhang_m",
+    "relative_placement_clearance_m",
+    "placement_verify_xy_tolerance_m", "placement_verify_z_tolerance_m",
     "gripper_open_width", "gripper_close_width",
     "planning_time", "num_planning_attempts", "velocity_scaling", "accel_scaling",
     "octomap_enabled_on_prepare", "desk_collision_enabled",
@@ -77,12 +95,26 @@ def validate_robot_parameters(parameters: dict) -> None:
         "cylinder_lying_axis_max_deviation_deg",
         "cylinder_max_diameter_m", "cylinder_min_length_m",
         "cylinder_max_length_m",
+        "transparent_bottle_diameter_m",
+        "transparent_bottle_height_m",
+        "transparent_bottle_label_bottom_m",
+        "transparent_bottle_label_height_m",
+        "transparent_bottle_min_height_m",
+        "transparent_bottle_tcp_max_spread_m",
+        "transparent_bottle_upright_min_p90_m",
+        "transparent_bottle_upright_min_p95_m",
+        "transparent_bottle_lying_min_p90_m",
+        "transparent_bottle_lying_min_p95_m",
+        "transparent_bottle_lying_max_p90_m",
+        "transparent_bottle_lying_max_p95_m",
         "grasp_pregrasp_distance",
         "grasp_retreat_distance", "grasp_candidate_timeout",
         "joint7_soft_limit_deg", "joint7_min_margin_deg",
         "planned_start_tolerance_rad", "reverse_branch_tolerance_rad",
         "gripper_open_width", "planning_time", "cartesian_eef_step",
-        "pos_tolerance", "ori_tolerance",
+        "pos_tolerance", "ori_tolerance", "stack_clearance_m",
+        "relative_placement_clearance_m", "placement_verify_xy_tolerance_m",
+        "placement_verify_z_tolerance_m",
     ):
         value = parameters.get(name)
         if not _is_number(value) or value <= 0:
@@ -94,6 +126,25 @@ def validate_robot_parameters(parameters: dict) -> None:
         errors.append("gripper_close_width must be a non-negative number")
     elif _is_number(open_width) and close_width >= open_width:
         errors.append("gripper_close_width must be smaller than gripper_open_width")
+
+    stack_clearance = parameters.get("stack_clearance_m")
+    if _is_number(stack_clearance) and stack_clearance > 0.02:
+        errors.append("stack_clearance_m must not exceed 0.02m")
+    relative_clearance = parameters.get("relative_placement_clearance_m")
+    if _is_number(relative_clearance) and relative_clearance > 0.10:
+        errors.append("relative_placement_clearance_m must not exceed 0.10m")
+    stack_overhang = parameters.get("stack_max_overhang_m")
+    if not _is_number(stack_overhang) or stack_overhang < 0.0:
+        errors.append("stack_max_overhang_m must be a non-negative number")
+    elif stack_overhang > 0.03:
+        errors.append("stack_max_overhang_m must not exceed 0.03m")
+    for name in (
+        "placement_verify_xy_tolerance_m",
+        "placement_verify_z_tolerance_m",
+    ):
+        value = parameters.get(name)
+        if _is_number(value) and value > 0.10:
+            errors.append(f"{name} must not exceed 0.10m")
 
     fraction = parameters.get("cartesian_min_fraction")
     if not _is_number(fraction) or not 0.0 < fraction <= 1.0:
@@ -121,6 +172,39 @@ def validate_robot_parameters(parameters: dict) -> None:
         or cylinder_frames < 3
     ):
         errors.append("cylinder_depth_frames must be an integer >= 3")
+    bottle_frames = parameters.get("transparent_bottle_depth_frames")
+    if (
+        not isinstance(bottle_frames, int)
+        or isinstance(bottle_frames, bool)
+        or bottle_frames < 3
+    ):
+        errors.append(
+            "transparent_bottle_depth_frames must be an integer >= 3"
+        )
+    bottle_max_frames = parameters.get(
+        "transparent_bottle_max_capture_frames"
+    )
+    if (
+        not isinstance(bottle_max_frames, int)
+        or isinstance(bottle_max_frames, bool)
+        or not isinstance(bottle_frames, int)
+        or bottle_max_frames < bottle_frames
+    ):
+        errors.append(
+            "transparent_bottle_max_capture_frames must be an integer >= "
+            "transparent_bottle_depth_frames"
+        )
+    bottle_label_points = parameters.get(
+        "transparent_bottle_min_label_points"
+    )
+    if (
+        not isinstance(bottle_label_points, int)
+        or isinstance(bottle_label_points, bool)
+        or bottle_label_points < 3
+    ):
+        errors.append(
+            "transparent_bottle_min_label_points must be an integer >= 3"
+        )
 
     full_plans = parameters.get("grasp_full_plan_candidates")
     if (not isinstance(full_plans, int) or isinstance(full_plans, bool)
@@ -174,6 +258,90 @@ def validate_robot_parameters(parameters: dict) -> None:
         errors.append(
             "cylinder_min_length_m must be smaller than "
             "cylinder_max_length_m"
+        )
+
+    bottle_diameter = parameters.get("transparent_bottle_diameter_m")
+    bottle_height = parameters.get("transparent_bottle_height_m")
+    bottle_label_bottom = parameters.get(
+        "transparent_bottle_label_bottom_m"
+    )
+    bottle_label_height = parameters.get(
+        "transparent_bottle_label_height_m"
+    )
+    bottle_upright_overtravel = parameters.get(
+        "transparent_bottle_upright_axis_overtravel_m"
+    )
+    if (
+        _is_number(bottle_diameter)
+        and _is_number(bottle_height)
+        and bottle_diameter >= bottle_height
+    ):
+        errors.append(
+            "transparent_bottle_diameter_m must be smaller than "
+            "transparent_bottle_height_m"
+        )
+    if (
+        _is_number(bottle_height)
+        and _is_number(bottle_label_bottom)
+        and _is_number(bottle_label_height)
+        and bottle_label_bottom + bottle_label_height > bottle_height
+    ):
+        errors.append(
+            "transparent bottle label must fit within the configured height"
+        )
+    if (
+        not _is_number(bottle_upright_overtravel)
+        or bottle_upright_overtravel < 0.0
+    ):
+        errors.append(
+            "transparent_bottle_upright_axis_overtravel_m must be a "
+            "non-negative number"
+        )
+    elif (
+        _is_number(bottle_diameter)
+        and bottle_upright_overtravel >= bottle_diameter * 0.5
+    ):
+        errors.append(
+            "transparent_bottle_upright_axis_overtravel_m must be smaller "
+            "than the bottle radius"
+        )
+    lying_min_p90 = parameters.get("transparent_bottle_lying_min_p90_m")
+    lying_min_p95 = parameters.get("transparent_bottle_lying_min_p95_m")
+    lying_p90 = parameters.get("transparent_bottle_lying_max_p90_m")
+    lying_p95 = parameters.get("transparent_bottle_lying_max_p95_m")
+    upright_p90 = parameters.get("transparent_bottle_upright_min_p90_m")
+    upright_p95 = parameters.get("transparent_bottle_upright_min_p95_m")
+    if (
+        _is_number(lying_min_p90)
+        and _is_number(lying_p90)
+        and lying_min_p90 >= lying_p90
+    ):
+        errors.append(
+            "transparent bottle lying p90 minimum must be below maximum"
+        )
+    if (
+        _is_number(lying_min_p95)
+        and _is_number(lying_p95)
+        and lying_min_p95 >= lying_p95
+    ):
+        errors.append(
+            "transparent bottle lying p95 minimum must be below maximum"
+        )
+    if (
+        _is_number(lying_p90)
+        and _is_number(upright_p90)
+        and lying_p90 >= upright_p90
+    ):
+        errors.append(
+            "transparent bottle p90 thresholds need a non-empty safety gap"
+        )
+    if (
+        _is_number(lying_p95)
+        and _is_number(upright_p95)
+        and lying_p95 >= upright_p95
+    ):
+        errors.append(
+            "transparent bottle p95 thresholds need a non-empty safety gap"
         )
 
     soft_limit = parameters.get("joint7_soft_limit_deg")

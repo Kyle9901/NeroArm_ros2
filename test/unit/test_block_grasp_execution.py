@@ -81,6 +81,13 @@ class _Bridge:
     def get_holding(self):
         return self.holding
 
+    def get_current_tcp_pose(self, timeout=1.0):
+        assert timeout > 0
+        return {
+            "position": [-0.35, -0.10, 0.025],
+            "quaternion": [0.0, 1.0, 0.0, 0.0],
+        }
+
     def get_block_xy_max_spread(self):
         return 0.015
 
@@ -197,6 +204,46 @@ def test_success_executes_selected_path_then_stays_holding_in_carry(monkeypatch)
         ("execute", "retreat-plan"),
         ("execute", "carry-plan"),
     ]
+
+
+def test_upright_bottle_logging_accepts_serialized_geometry(monkeypatch, capsys):
+    bridge = _Bridge()
+    monkeypatch.setattr(
+        manipulation,
+        "plan_transparent_bottle_grasp",
+        lambda *_args, **_kwargs: _planning(),
+    )
+    monkeypatch.setattr(manipulation.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        manipulation.motion,
+        "control_gripper",
+        lambda *_args, **_kwargs: ComponentResult.success(),
+    )
+    monkeypatch.setattr(
+        manipulation.motion,
+        "execute_planned",
+        lambda *_args, **_kwargs: ComponentResult.success(),
+    )
+    monkeypatch.setattr(
+        manipulation.motion,
+        "read_joint_state",
+        _joint_feedback(0.05),
+    )
+    geometry = {
+        "surface": {"x": -0.35, "y": -0.10, "z": 0.025},
+        "center": {"x": -0.35, "y": -0.10, "z": 0.025},
+        "orientation_class": "upright",
+        "quality": {"reliable": True},
+    }
+
+    result = manipulation._grasp_transparent_bottle(
+        bridge, -0.35, -0.10, 0.025, geometry, _geometry(),
+    )
+
+    assert result.ok
+    output = capsys.readouterr().out
+    assert "visual_axis=(-0.3500,-0.1000,0.0250)" in output
+    assert "reached_tcp=(-0.3500,-0.1000,0.0250)" in output
 
 
 def test_unknown_holding_preserves_gripper_and_disables_retry(monkeypatch):
@@ -778,6 +825,13 @@ def test_grasp_router_enables_shape_candidates_for_block_and_cylinder(monkeypatc
             calls.append("cylinder") or ComponentResult.success()
         ),
     )
+    monkeypatch.setattr(
+        manipulation,
+        "_grasp_transparent_bottle",
+        lambda *_args, **_kwargs: (
+            calls.append("transparent_bottle") or ComponentResult.success()
+        ),
+    )
 
     manipulation.grasp_object(
         bridge, -0.35, -0.1, 0.05,
@@ -789,5 +843,10 @@ def test_grasp_router_enables_shape_candidates_for_block_and_cylinder(monkeypatc
         geometry={"quality": {"reliable": True}},
         target="红色瓶子",
     )
+    manipulation.grasp_object(
+        bridge, -0.35, -0.1, 0.05,
+        geometry={"quality": {"reliable": True}},
+        target="矿泉水瓶",
+    )
 
-    assert calls == ["block", "cylinder"]
+    assert calls == ["block", "cylinder", "transparent_bottle"]
